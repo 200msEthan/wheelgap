@@ -168,7 +168,8 @@ For a project file, this includes any extras you select with `--extra` or `--all
 tree for each target from PyPI's metadata: for each requirement, the newest release that meets every constraint on it,
 supports the target's Python and isn't yanked (a yanked release only for an `==` pin), following markers and extras as
 pip evaluates them on that target. `--explain` shows the path to each gap (`via: mcp → PyJWT → cryptography`), and
-`--json --explain` has it as `via`. A release picked differently for two Pythons is a row for each.
+`--json --explain` has it as `via`. After 0.11.0, `--explain` with `--deps` also turns on [`--suggest`](#suggest),
+so each gap ends with the release to move to (`--no-suggest` turns it off). A release picked differently for two Pythons is a row for each.
 
 With a requirements file, each requirement line is a root — pinned or not, with its markers and extras — and `-r`
 includes are read too. A `-c` constraint file's constraints apply to the resolved tree, to dependencies as well as
@@ -266,7 +267,7 @@ opt-in, and only for packages that pass [the PyPI-origin rule](how-it-works.md#p
 `--index-url`, `WHEELGAP_INDEX_URL` or a pip or uv index setting in the environment. `build-info = true` in
 `[tool.wheelgap]` turns it on by default. See [Build requirements](output.md#build-info).
 
-### `--suggest` {#suggest}
+### `--suggest`, `--no-suggest` {#suggest}
 
 With `--explain`, also name the lowest newer release with a wheel for a pinned package's gap targets
 (`fastlib 2.0.0 -> 2.1.0 has wheels for musl-aarch64, win-amd64`) that keeps the wheels the package has on its other
@@ -276,9 +277,14 @@ summary or the exit code. A run with `--index-url` or `WHEELGAP_INDEX_URL` looks
 flag. With `--markdown`, it renders suggestions as a Markdown list under the explanation. With `--json`, adds `suggest` to each package with a gap. See
 [Newer releases](output.md#suggest).
 
+**After 0.11.0.** With `--deps --explain` it's on by default, since `--deps` already looks every package in the tree
+up on PyPI: each gap ends with the way out, the nearest newer release with the wheel or the last older one that had
+it. That's only when `--deps` resolved every input; with a lockfile or an already-pinned requirements file among them,
+it stays opt-in, since those packages' names weren't sent to PyPI. `--no-suggest` turns it off.
+
 ### `--write-constraints` {#write-constraints}
 
-**After 0.11.0.** `--write-constraints FILE` (with `--explain --suggest`): also write what `--suggest` found to a
+**After 0.11.0.** `--write-constraints FILE` (with `--explain --suggest`, or `--deps --explain`, which turns `--suggest` on): also write what `--suggest` found to a
 pip/uv constraints file, one pin per package:
 
 ```text
