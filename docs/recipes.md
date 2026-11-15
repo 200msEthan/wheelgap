@@ -48,6 +48,41 @@ deployment Python version and targets from the same
 options after `--`, for example `nox -s wheels -- --explain`. A gap that fails
 wheelgap's configured policy also fails the nox session.
 
+## Renovate
+
+Save this as `.github/workflows/wheelgap.yml` in a project that commits its
+`uv.lock`:
+
+```yaml
+name: Wheel coverage
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  wheels:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: wheelgap/wheelgap@v0.11.0
+        with:
+          args: uv.lock -p 3.13 -t linux-x86_64,musl-aarch64
+          compare-to: base
+```
+
+The job runs on Renovate's and other pull requests. It compares the merged
+lockfile with the pull request's base and fails when a dependency update drops
+a wheel for one of the configured targets. Mark the `wheels` check as required
+for the target branch if you want it to block Renovate automerge.
+
+Replace the targets with the ones you deploy, or set them in
+[`[tool.wheelgap]`](configuration.md) and shorten `args` to `uv.lock`.
+Keep the pull request's default merge checkout so [`compare-to: base`](ci.md#compare-to)
+can find the base lockfile. `fetch-depth: 0` fetches the base branch with it, which a private repository needs
+with `persist-credentials: false`.
+
 ## Multi-arch images
 
 Check both architectures before building an image for AMD64 and ARM64. This
