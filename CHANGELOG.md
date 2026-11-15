@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `check_packages()` and `check_package()` in the Python API, and the MCP server's `check_package` tool, now skip a pin's files whose `Requires-Python` leaves out each target's Python, as the command line does since #291: `check_packages([("x", "1.0")], make_targets(python="3.9,3.13"))` used to report a wheel on 3.9 for a release that needs Python 3.10, and now reports `missing` there, with the reason in `rejected` and `reasons` on 3.9 only. (#312, thanks [@kushaldave002](https://github.com/kushaldave002))
 - Automatic cache pruning and `--clear-cache` remove obsolete `pinned-v1` entries without following links or deleting unrelated files. `--clear-cache` includes those entries in its removed count. (#319, thanks [@Vansh170707](https://github.com/Vansh170707))
 - With `--explain --notes`, packages with gaps only on platforms the tracker does not scan (such as iOS or RISC-V) are no longer sent to wheelgap.github.io. The "add --notes" hint is also suppressed for those runs. (#315, thanks [@kunalkshah1](https://github.com/kunalkshah1))
 - `--dockerfile` now recognizes `index.docker.io/python` and `index.docker.io/library/python` as official Python images. (#306, thanks [@LetMeSleep8h](https://github.com/LetMeSleep8h))
