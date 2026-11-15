@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- MCP: `check_package` takes `dependencies: true` to also check everything the package installs, resolved as `--deps` does: `dependency_gaps` lists each package in the tree with a gap, with its `results`, `gaps` and `via` path (`mcp → PyJWT → cryptography`), `dependencies_checked` counts the packages checked, and `ok` covers the whole tree. (#390, thanks [@kushaldave002](https://github.com/kushaldave002))
 - Action: with `compare-to` and `comment: true`, the pull request comment now gives the way out under each package that got worse, from `--explain --suggest`: the nearest newer release that brings the wheels back, or the last older one that had them. Lookups are only for packages known to come from PyPI, and a failed one leaves the comment and the result as they were. (#389, thanks [@Golden007-prog](https://github.com/Golden007-prog))
 - `--deps` now also works on requirements files: each requirement line is a root, markers and extras and `-c` constraints apply, `--no-binary` and `--only-binary` reach the resolved packages, and the whole tree the file installs is checked per target. A fully pinned `pip-compile` file (every requirement pinned, with `--hash` lines or `# via` comments) is checked as written, with a note. (#387, thanks [@Seyamalam](https://github.com/Seyamalam))
 - `--deps` also resolves the transitive dependencies of a `pyproject.toml`, including selected extras and target-specific markers. (#386, thanks [@Golden007-prog](https://github.com/Golden007-prog))
