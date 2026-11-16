@@ -79,6 +79,78 @@ Tool calls send progress notifications when the client asks for them and don't
 stop the server answering `ping`. A cancelled call sends no more progress and no
 result, but its index lookups still finish before the next call starts.
 
+### Tool arguments
+
+Each tool's arguments, taken from the `description`s in `TOOLS` in `mcp.py`
+(`inputSchema.properties`). Types are JSON types; defaults are shown where the
+tool has one. `check_lockfile` and `check_dist` read the project's `pyproject.toml`
+(and `.python-version`) as the command line does, so a setting there comes
+before the built-in default: the lockfile's folder for `check_lockfile`, and
+for `check_dist` the nearest folder above the dist folder with a
+`pyproject.toml`.
+
+#### `check_package`
+
+| Argument | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | required | The package name alone, e.g. 'numpy'. |
+| `version` | string | latest release | An exact version, e.g. '2.3.4'. Default: the latest release, which may not support an older Python (it then shows gaps an older release wouldn't have). |
+| `python` | string | server's | Target Python version(s), comma-separated, e.g. '3.13' or '3.12,3.14t' (t = free-threaded); 'next' and 'next-t' mean the newest CPython wheelgap knows. Default: the server's. |
+| `targets` | array of strings | `linux-x86_64`, `linux-aarch64`, `macos-arm64`, `win-amd64` | Platforms, e.g. ['linux-aarch64', 'musl-x86_64', 'win-arm64', 'pyodide'], Docker platforms such as 'linux/arm64', or the groups 'all', 'everything' and 'mobile'. `list_targets` gives every name. |
+| `glibc` | string | `2.36` | glibc version for `linux-*` targets, e.g. '2.28' for a RHEL 8 image. |
+| `musl` | string | `1.2` | musl version for `musl-*` (Alpine) targets. |
+| `macos` | string | `14.0` | Oldest macOS version to support. |
+| `pyodide_lock` | string | none | Absolute path or https URL of a Pyodide release's `pyodide-lock.json`, so packages that release ships itself count as 'bundled' on pyodide targets for its Python. |
+| `explain` | boolean | `false` | Also return `rejected` (and `via`, always empty for one package) and `issues_url` (the package's issue tracker from PyPI metadata): why each source or missing target can't use the published wheels. |
+| `dependencies` | boolean | `false` | Also check everything the package installs (its dependency tree, resolved from PyPI for each target, as `--deps` does) and return `dependency_gaps`. |
+
+#### `check_lockfile`
+
+| Argument | Type | Default | Description |
+| --- | --- | --- | --- |
+| `path` | string | required | Absolute path or `file://` URI of the lockfile or project directory (a relative path is looked for in the client's roots if it shares them, else in the server's working directory). |
+| `environment` | string | `default` | The pixi.lock environment to check. Only for pixi.lock inputs. |
+| `python` | string | `[tool.wheelgap] python`, then `.python-version`, else the server's | Target Python version(s), comma-separated, e.g. '3.13' or '3.12,3.14t' (t = free-threaded); 'next' and 'next-t' mean the newest CPython wheelgap knows. |
+| `targets` | array of strings | `[tool.wheelgap] targets`, then `[tool.uv] required-environments`, else the four default platforms | Platforms, e.g. ['linux-aarch64', 'musl-x86_64', 'win-arm64', 'pyodide'], Docker platforms such as 'linux/arm64', or the groups 'all', 'everything' and 'mobile'. `list_targets` gives every name. |
+| `glibc` | string | `[tool.wheelgap] glibc` or `distro`, else `2.36` | glibc version for `linux-*` targets, e.g. '2.28' for a RHEL 8 image. |
+| `musl` | string | `[tool.wheelgap] musl` or `distro`, else `1.2` | musl version for `musl-*` (Alpine) targets. |
+| `macos` | string | `[tool.wheelgap] macos`, else `14.0` | Oldest macOS version to support. |
+| `pyodide_lock` | string | `[tool.wheelgap] pyodide-lock` (when a pyodide target is checked) | Absolute path or https URL of a Pyodide release's `pyodide-lock.json`. |
+| `offline` | boolean | `[tool.wheelgap] offline`, else `false` | Use only the files recorded in the lockfile; never contact the index. `true` turns it on; `offline = true` in the project can't be turned off from here. |
+
+#### `check_dockerfile`
+
+| Argument | Type | Default | Description |
+| --- | --- | --- | --- |
+| `dockerfile` | string | required | Absolute path or `file://` URI of the Dockerfile (a relative path is looked for in the client's roots if it shares them, else in the server's working directory). |
+| `path` | string | the Dockerfile's folder | Absolute path or `file://` URI of the lockfile or project directory. |
+| `build_args` | object (string values) | `{}` | The build's `--build-arg` values, e.g. {'PYTHON_VERSION': '3.13'}: each replaces the default of the global ARG it names, as in docker build. |
+| `targets` | array of strings | the image's platform | Platforms to check instead of the image's, e.g. ['linux/arm64'] (with an Alpine image, Docker platforms mean musl). |
+
+#### `check_dist`
+
+| Argument | Type | Default | Description |
+| --- | --- | --- | --- |
+| `path` | string | required | Absolute path or `file://` URI of the folder of built files (a relative path is looked for in the client's roots if it shares them, else in the server's working directory). |
+| `python` | string | `[tool.wheelgap] python`, then `.python-version`, else the server's | Target Python version(s), comma-separated, e.g. '3.13' or '3.12,3.14t' (t = free-threaded); 'next' and 'next-t' mean the newest CPython wheelgap knows. |
+| `targets` | array of strings | `[tool.wheelgap] targets`, then `[tool.uv] required-environments`, else the four default platforms | Platforms, e.g. ['linux-aarch64', 'musl-x86_64', 'win-arm64', 'pyodide'], Docker platforms such as 'linux/arm64', or the groups 'all', 'everything' and 'mobile'. `list_targets` gives every name. |
+| `glibc` | string | `[tool.wheelgap] glibc` or `distro`, else `2.36` | glibc version for `linux-*` targets, e.g. '2.28' for a RHEL 8 image. |
+| `musl` | string | `[tool.wheelgap] musl` or `distro`, else `1.2` | musl version for `musl-*` (Alpine) targets. |
+| `macos` | string | `[tool.wheelgap] macos`, else `14.0` | Oldest macOS version to support. |
+
+#### `diff_lockfiles`
+
+| Argument | Type | Default | Description |
+| --- | --- | --- | --- |
+| `old` | string | required | Absolute path to the lockfile (or project directory) before the change. |
+| `new` | string | required | Absolute path to the lockfile (or project directory) after the change. |
+| `python` | string | the server's | Target Python version(s), comma-separated, e.g. '3.13' or '3.12,3.14t' (t = free-threaded); 'next' and 'next-t' mean the newest CPython wheelgap knows. |
+| `targets` | array of strings | the four default platforms | Platforms, e.g. ['linux-aarch64', 'musl-x86_64', 'win-arm64', 'pyodide'], Docker platforms such as 'linux/arm64', or the groups 'all', 'everything' and 'mobile'. `list_targets` gives every name. |
+
+#### `list_targets`
+
+No arguments.
+
 ## Claude Code
 
 Add it for yourself, in the current project:

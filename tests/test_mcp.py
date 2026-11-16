@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import re
 import threading
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -1809,6 +1810,17 @@ def test_mcp_docs_name_every_tool():
     text = (Path(__file__).resolve().parent.parent / "docs" / "mcp.md").read_text(encoding="utf-8")
     for tool in mcp.TOOLS:
         assert f"`{tool['name']}`" in text
+
+
+def test_mcp_docs_name_every_tool_argument():
+    """docs/mcp.md lists exactly the arguments each tool's inputSchema accepts in that tool's own table, so a new one
+    can't go undocumented, a removed one can't stay, and one tool's row can't stand in for another's."""
+    text = (Path(__file__).resolve().parent.parent / "docs" / "mcp.md").read_text(encoding="utf-8")
+    sections = dict(re.findall(r"^#### `(\w+)`\n(.*?)(?=^#|\Z)", text, re.M | re.S))
+    assert set(sections) == {tool["name"] for tool in mcp.TOOLS}
+    for tool in mcp.TOOLS:
+        documented = set(re.findall(r"^\| `(\w+)` \|", sections[tool["name"]], re.M))
+        assert documented == set(tool["inputSchema"]["properties"]), tool["name"]
 
 
 # The 2026-07-28 revision: no handshake; every request carries its version and the client's capabilities in _meta.
