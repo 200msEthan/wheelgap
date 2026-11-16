@@ -41,6 +41,7 @@ from .constraints import write_constraints
 from .deps import Resolver, pinned_complete, resolve_deps
 from .dockerfile import DockerfileError, read_dockerfile
 from .github import github_annotations
+from .install_log import failed_builds, log_source, read_log
 from .junit import write_junit
 from .logsafe import guarded_output, write_command
 from .offline import require_offline, undo_offline
@@ -242,6 +243,12 @@ def make_parser() -> argparse.ArgumentParser:
         "--clear-cache",
         action="store_true",
         help="delete the cache of pinned package lookups first; with no INPUT, do only that",
+    )
+    p.add_argument(
+        "--from-log",
+        metavar="FILE",
+        help="read the packages a failed pip or uv install couldn't build from its log FILE (- for stdin) and check "
+        "them with --explain --suggest; needs -p and -t (or --dockerfile) for where the install ran",
     )
     p.add_argument("--all", action="store_true", help="show every package, not just the ones with gaps")
     p.add_argument("--explain", action="store_true", help="for each gap, list the wheels that were rejected and why")
@@ -1552,6 +1559,31 @@ def _main(argv: list[str]) -> int:
         parser.error("--list-targets has no Markdown form (use --json)")
     if args.offline and args.online:
         parser.error("--offline and --online can't be used together")
+    if args.from_log is not None:
+        given = [
+            flag
+            for flag, value in (
+                ("INPUT", args.inputs),
+                ("--dist", args.dist),
+                ("--deps", args.deps),
+                ("--environment", args.environment is not None),
+                ("--suggest-targets", args.suggest_targets is not None),
+                ("--list-targets", args.list_targets),
+                ("--clear-cache", args.clear_cache),
+            )
+            if value
+        ]
+        if given:
+            parser.error(f"--from-log checks the packages in the log, so it can't be used with {', '.join(given)}")
+        if not args.dockerfile and not (args.python and args.target):
+            # The log doesn't say where it ran, and the machine wheelgap runs on is often not that one.
+            parser.error(
+                "--from-log needs the Python and platform the install ran on: pass -p and -t, "
+                "such as -p 3.13 -t win-arm64 (or --dockerfile for a docker build)"
+            )
+        args.explain = True
+        if args.suggest is None:  # --no-suggest still turns it off
+            args.suggest = True
     if args.suggest_targets is not None:
         if args.markdown:
             parser.error("--suggest-targets has no Markdown form (use --json)")
@@ -1614,12 +1646,16 @@ def _main(argv: list[str]) -> int:
             return 0
         pyproject = find_pyproject(args.inputs)
         config = load_config(pyproject) if pyproject else {}
-        quiet = args.quiet if args.quiet is not None else config.get("quiet", False)
+        # quiet = true is a project default, so --from-log (which explains each package) on the command line wins over
+        # it, as --no-quiet does; --quiet on the command line still applies.
+        quiet = args.quiet if args.quiet is not None else config.get("quiet", False) and args.from_log is None
         # offline = true is a project default, so --online on the command line wins over it.
         offline = args.offline or (config.get("offline", False) and not args.online)
         offline_how = "--offline" if args.offline else "offline = true in [tool.wheelgap]"
         # Quiet only changes the text output, so it can't clash with --explain when printing JSON or Markdown.
         if quiet and args.explain and not (args.json or args.markdown):
+            if args.from_log is not None:
+                parser.error("--from-log explains each package, so it can't be used with --quiet")
             parser.error("--explain cannot be used with quiet mode (--quiet or quiet = true; --no-quiet turns it off)")
         docker_musl = False
         if args.dockerfile:
@@ -1710,7 +1746,15 @@ def _main(argv: list[str]) -> int:
                 )
         else:
             check_index_url()  # WHEELGAP_INDEX_URL only matters for the JSON API
-        sources = [parse_dist(Path(args.dist))] if args.dist else load_inputs(args.inputs or ["."], args.environment)
+        if args.from_log is not None:
+            failures = failed_builds(read_log(args.from_log), other_index=origin.other_index(index_url) is not None)
+            listed = ", ".join(f"{name} {version}" for name, version in failures)
+            print(f"wheelgap: note: the install log says these failed to build: {listed}", file=sys.stderr)
+            sources = [log_source(failures)]
+        else:
+            sources = (
+                [parse_dist(Path(args.dist))] if args.dist else load_inputs(args.inputs or ["."], args.environment)
+            )
         for source in sources:
             check_report_targets(source, targets)
             if source.passed_over is not None and not quiet:
@@ -2006,6 +2050,16 @@ def _main(argv: list[str]) -> int:
         if r.package.key in ignore_on:
             r.ignored = frozenset(t for t in targets if t.platform in ignore_on[r.package.key])
     gaps = [r for r in rows if not r.ok]
+    if args.from_log is not None:
+        multi_py = len({t.python for t in targets}) > 1
+        for r in rows:
+            if fits := [t.label(multi_py) for t, status in r.results.items() if status == Status.WHEEL]:
+                print(
+                    f"wheelgap: note: the install log says {r.package.name} failed to build, but "
+                    f"{r.package.name} {r.package.version} has a wheel for {', '.join(fits)}: the log likely "
+                    "comes from another platform or Python than the one checked (-p, -t)",
+                    file=sys.stderr,
+                )
     source_labels = [s.label for s in sources]
     row_notes: RowNotes = {}
     row_builds: RowBuilds = {}
