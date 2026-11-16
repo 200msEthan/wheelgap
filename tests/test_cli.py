@@ -6,6 +6,7 @@ from pathlib import Path
 
 import packaging
 import pytest
+from test_deps import index  # noqa: F401  (the fake PyPI --deps resolves against)
 
 import wheelgap
 from wheelgap import cli
@@ -579,9 +580,9 @@ def test_offline_refuses_a_pipfile_lock_mirror_on_wheelgap_index_url(capsys, tmp
     assert code == 2
     assert "Pipfile.lock needs the index for 2 packages (fastlib, purewheel)" in err
     # --index-url replaces the JSON API, so WHEELGAP_INDEX_URL's host doesn't count and they're skipped again.
-    index = "https://mirror.example.com/simple"
+    index_url = "https://mirror.example.com/simple"
     code, out, err = run(
-        capsys, str(path), "--offline", "--index-url", index, "-p", "3.13", "-t", "linux-x86_64", "--json"
+        capsys, str(path), "--offline", "--index-url", index_url, "-p", "3.13", "-t", "linux-x86_64", "--json"
     )
     assert code == 0, err
     assert len(json.loads(out)["skipped"]) == 2
@@ -2756,6 +2757,127 @@ def test_github_annotations_requirements(capsys, fake_pypi, tmp_path, monkeypatc
         "::error file=more/extra.txt,line=2,title=winonly 311%3A can't install::"
         "winonly 311 can't install on linux-x86_64.",
     ]
+
+
+def test_github_annotations_deps_keeps_a_direct_requirements_line(index, capsys, tmp_path, monkeypatch):  # noqa: F811
+    # --deps checks the resolved tree, but a direct requirement's gap is still on its own line (#432).
+    # app pulls in more than the file names (and crypt again, through lib[crypto]): crypt is still its own line's.
+    (tmp_path / "requirements.txt").write_text("crypt==1.0\napp==1.0\n", encoding="utf-8")
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    code, out, _ = run(
+        capsys,
+        str(tmp_path / "requirements.txt"),
+        "--deps",
+        "-p",
+        "3.14",
+        "-t",
+        "win-arm64",
+        "--github-annotations",
+    )
+    assert code == 1
+    assert (
+        "::error file=requirements.txt,line=1,title=crypt 1.0%3A builds from source::"
+        "crypt 1.0 builds from source on win-arm64."
+    ) in annotation_lines(out)
+
+
+def test_github_annotations_deps_a_marked_requirement_keeps_its_line(index, capsys, tmp_path, monkeypatch):  # noqa: F811
+    (tmp_path / "requirements.txt").write_text('crypt==1.0; sys_platform == "win32"\napp==1.0\n', encoding="utf-8")
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    _, out, _ = run(
+        capsys, str(tmp_path / "requirements.txt"), "--deps", "-p", "3.14", "-t", "win-arm64", "--github-annotations"
+    )
+    (line,) = [ln for ln in annotation_lines(out) if "title=crypt" in ln]
+    assert line.startswith("::error file=requirements.txt,line=1,")
+
+
+def test_github_annotations_deps_direct_on_one_python_pulled_in_on_another(index, capsys, tmp_path, monkeypatch):  # noqa: F811
+    # crypt is the file's own requirement on 3.14 but comes through parenta on 3.13: neither line is right for
+    # both, so the annotation names the file only, and says the via applies to some targets.
+    (tmp_path / "requirements.txt").write_text('crypt==1.0; python_version >= "3.14"\nparenta==1.0\n', encoding="utf-8")
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    _, out, _ = run(
+        capsys,
+        str(tmp_path / "requirements.txt"),
+        "--deps",
+        "-p",
+        "3.13",
+        "-p",
+        "3.14",
+        "-t",
+        "win-arm64",
+        "--github-annotations",
+    )
+    (line,) = [ln for ln in annotation_lines(out) if "title=crypt" in ln]
+    assert line.startswith("::error file=requirements.txt,title=crypt 1.0%3A builds from source::")
+    assert "(via parenta on some targets)." in line
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # crypt's own line is Linux-only: on Windows parenta and parentb pull it in, so that line is the wrong one.
+        'crypt==1.0; sys_platform == "linux"\nparenta==1.0\nparentb==1.0\n',
+        # One puller, but on two lines: neither is certain, and crypt's Linux-only line is still the wrong one.
+        'crypt==1.0; sys_platform == "linux"\n'
+        'parenta==1.0; python_version >= "3"\nparenta==1.0; python_version < "3"\n',
+    ],
+)
+def test_github_annotations_deps_never_uses_a_line_that_isnt_where_it_comes_from(
+    index,  # noqa: F811  (the index fixture)
+    capsys,
+    tmp_path,
+    monkeypatch,
+    text,
+):
+    (tmp_path / "requirements.txt").write_text(text, encoding="utf-8")
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    _, out, _ = run(
+        capsys, str(tmp_path / "requirements.txt"), "--deps", "-p", "3.14", "-t", "win-arm64", "--github-annotations"
+    )
+    (line,) = [ln for ln in annotation_lines(out) if "title=crypt" in ln]
+    assert line.startswith("::error file=requirements.txt,title=crypt 1.0%3A builds from source::")
+
+
+def test_github_annotations_deps_a_transitive_gap_names_its_requirement(index, capsys, tmp_path, monkeypatch):  # noqa: F811
+    # crypt is pulled in by parenta alone: the annotation sits on parenta's line and says via whom (#432).
+    (tmp_path / "requirements.txt").write_text("parenta==1.0\n", encoding="utf-8")
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    code, out, _ = run(
+        capsys,
+        str(tmp_path / "requirements.txt"),
+        "--deps",
+        "-p",
+        "3.14",
+        "-t",
+        "win-arm64",
+        "--github-annotations",
+    )
+    assert code == 1
+    assert annotation_lines(out) == [
+        "::error file=requirements.txt,line=1,title=crypt 1.0%3A builds from source::"
+        "crypt 1.0 builds from source on win-arm64 (via parenta)."
+    ]
+
+
+def test_github_annotations_deps_two_pullers_stay_file_only(index, capsys, tmp_path, monkeypatch):  # noqa: F811
+    # parenta and parentb both pull crypt in: no line is safe, so the file alone carries both names (#432).
+    (tmp_path / "requirements.txt").write_text("parenta==1.0\nparentb==1.0\n", encoding="utf-8")
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    code, out, _ = run(
+        capsys,
+        str(tmp_path / "requirements.txt"),
+        "--deps",
+        "-p",
+        "3.14",
+        "-t",
+        "win-arm64",
+        "--github-annotations",
+    )
+    assert code == 1
+    (line,) = annotation_lines(out)
+    assert line.startswith("::error file=requirements.txt,title=crypt 1.0%3A builds from source::")
+    assert "builds from source on win-arm64 (via parenta, parentb)." in line
 
 
 @pytest.mark.parametrize(

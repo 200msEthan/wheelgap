@@ -378,6 +378,13 @@ so CI can publish it; an empty `PATH` is an error, as for `--junit`. See [Recipe
 Also mark each package with a gap on its own line of the lockfile in GitHub Actions, as an
 annotation. The GitHub Action passes it; see [CI](ci.md#annotations).
 
+With `--deps` on a requirements file (after 0.12.0), a direct requirement's
+gap is on its own line, as without `--deps`. A transitive gap goes on the line
+of the requirement that pulls it in when exactly one does on every target where
+it has a gap, and its message says `(via …)`. When more than one does, or a
+line isn't certain, the annotation names the file without a line, and the
+message names them all.
+
 ### `--color` {#color}
 
 `--color {auto,always,never}`: color the table. `auto` (the default) colors a terminal, and respects the `NO_COLOR` and
