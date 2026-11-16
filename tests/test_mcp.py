@@ -751,21 +751,27 @@ def test_check_lockfile_passes_on_notes(fake_pypi, fixtures):
     assert not fake_pypi
 
 
-@pytest.mark.parametrize("force_color", [False, True])
-def test_check_lockfile_keeps_dimmed_notes_with_force_color(fake_pypi, tmp_path, monkeypatch, force_color):
-    # A dimmed note is prefixed with an ANSI escape when FORCE_COLOR is set, so _run_cli would no longer
-    # recognise it as "wheelgap: note:" and would drop it (#449). Have the CLI emit one through its
-    # --build-info lookup (build-info in the project, --explain from dependencies) and check it survives.
-    if force_color:
-        monkeypatch.setenv("FORCE_COLOR", "1")
-    project = tmp_path / "proj"
-    project.mkdir()
-    (project / "pyproject.toml").write_text("[tool.wheelgap]\nbuild-info = true\n", encoding="utf-8")
-    (project / "requirements.txt").write_text("demo==1.0\n", encoding="utf-8")
-    monkeypatch.setattr(cli, "lookup_all", lambda *a, **k: (None, "the lookup deadline passed"))
-    (_, reply) = run(init(), call("check_lockfile", path=str(project), dependencies=True))
-    notes = reply["result"]["structuredContent"]["notes"]
-    assert any("the lookup deadline passed" in note for note in notes)
+def test_every_cli_run_keeps_notes_plain(fake_pypi, tmp_path, fixtures, monkeypatch):
+    # A dimmed note under FORCE_COLOR starts with an ANSI escape instead of "wheelgap: ", so _run_cli would drop it
+    # (#449): every run the server makes passes --color=never, whichever tool and options start it.
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    seen = []
+    real = cli.main
+
+    def spy(argv=None, **kwargs):
+        seen.append(list(argv or []))
+        return real(argv, **kwargs)
+
+    monkeypatch.setattr(cli, "main", spy)
+    (tmp_path / "uv.lock").write_bytes((fixtures / "uvproj" / "uv.lock").read_bytes())
+    (tmp_path / "requirements.txt").write_text("purewheel==3.1\n", encoding="utf-8")
+    run(
+        init(),
+        call("check_lockfile", path=str(tmp_path / "uv.lock"), python="3.13", offline=True),
+        call("check_lockfile", 2, path=str(tmp_path / "requirements.txt"), python="3.13", dependencies=True),
+    )
+    assert len(seen) == 2
+    assert all("--color=never" in argv for argv in seen)
 
 
 def test_check_lockfile_explicit_python_beats_python_version_file(fake_pypi, tmp_path, fixtures):
@@ -2553,3 +2559,24 @@ def test_check_package_dependencies_counts_every_release_of_the_package_asked_ab
     assert data["results"] == {"3.14 win-arm64": "wheel", "3.15 win-arm64": "source"}
     assert data["versions"] == ["1.0", "2.0"]
     assert data["dependencies_checked"] == 0
+
+
+def test_check_lockfile_dependencies_skips_build_info_when_configured(fake_pypi, fake_files, tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "demo"\nversion = "0.1.0"\ndependencies = ["nowheels==0.9"]\n\n'
+        "[tool.wheelgap]\nbuild-info = true\n",
+        encoding="utf-8",
+    )
+    (_, reply) = run(
+        init(),
+        call(
+            "check_lockfile",
+            path=str(tmp_path / "pyproject.toml"),
+            python="3.13",
+            targets=["linux-x86_64"],
+            dependencies=True,
+        ),
+    )
+    data = reply["result"]["structuredContent"]
+    assert data["ok"] is False
+    assert fake_files.calls == []
