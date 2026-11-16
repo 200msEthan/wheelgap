@@ -335,12 +335,63 @@ def _normalise_label(label: str) -> str:
     return label.translate(_LABEL_DROP).lower()
 
 
+# Top-level GitLab routes that are site pages, not a group or user (gitlab.com/explore/projects is not a project).
+_GITLAB_RESERVED_PATHS = frozenset(
+    {
+        "-",
+        ".well-known",
+        "admin",
+        "api",
+        "assets",
+        "dashboard",
+        "explore",
+        "files",
+        "groups",
+        "help",
+        "import",
+        "jwt",
+        "login",
+        "oauth",
+        "profile",
+        "projects",
+        "public",
+        "s",
+        "search",
+        "sitemap",
+        "snippets",
+        "uploads",
+        "users",
+        "v2",
+    }
+)
+
+# Top-level Codeberg (Forgejo) routes that are site pages, not a user or organization.
+_CODEBERG_RESERVED_PATHS = frozenset(
+    {
+        "-",
+        "admin",
+        "api",
+        "assets",
+        "attachments",
+        "avatars",
+        "explore",
+        "issues",
+        "milestones",
+        "notifications",
+        "org",
+        "pulls",
+        "repo",
+        "user",
+    }
+)
+
+
 def extract_issues_url(project_urls: dict[str, str] | None, homepage: str | None = None) -> str | None:
     """Extract an HTTPS issue tracker URL from PyPI metadata.
 
     Reads `project_urls` with labels normalised as PEP 753 does (so `Issue-Tracker` and `bug_tracker` count),
     preferring issue tracker keys (Issues, Bug Tracker, Tracker).
-    Falls back to a GitHub Source/Homepage URL with `/issues` added.
+    Falls back to a GitHub, GitLab, or Codeberg Source/Homepage URL with its issue path added.
     Refuses any URL that is not an https:// URL, and any with a character that isn't printable ASCII: the URL comes
     from the package's own metadata and is printed to a terminal, where an escape sequence could rewrite the output.
     """
@@ -378,13 +429,41 @@ def extract_issues_url(project_urls: dict[str, str] | None, homepage: str | None
             parsed = urlsplit(candidate)
         except ValueError:
             continue
-        if parsed.scheme == "https" and parsed.netloc.lower() in ("github.com", "www.github.com") and _plain(candidate):
-            segments = [s for s in parsed.path.strip("/").split("/") if s]
+        host = parsed.netloc.lower()
+        if parsed.scheme != "https" or not parsed.netloc or "@" in parsed.netloc or not _plain(candidate):
+            continue
+
+        # A browser decodes %2e and treats a backslash as a slash, so either could turn the link into a site page.
+        if "%" in parsed.path or "\\" in parsed.path:
+            continue
+        segments = [s for s in parsed.path.strip("/").split("/") if s]
+        if any(s in (".", "..") for s in segments):
+            continue
+
+        if host in ("github.com", "www.github.com"):
             if len(segments) >= 2:
                 owner, repo = segments[0], segments[1].removesuffix(".git")
                 if owner.lower() in _GITHUB_RESERVED_PATHS:
                     continue
                 return f"https://github.com/{owner}/{repo}/issues"
+        elif host == "codeberg.org":
+            if len(segments) == 2:
+                owner, repo = segments[0], segments[1].removesuffix(".git")
+                if owner.lower() in _CODEBERG_RESERVED_PATHS or not repo:
+                    continue
+                return f"https://codeberg.org/{owner}/{repo}/issues"
+        elif host == "gitlab.com":
+            # A project path can be nested (group/subgroup/project), so only `/-/` marks where it ends.
+            # Without one, only owner/repo is taken as a project.
+            project = segments[: segments.index("-")] if "-" in segments else segments
+            if "-" not in segments and len(project) != 2:
+                continue
+            if len(project) < 2 or project[0].lower() in _GITLAB_RESERVED_PATHS:
+                continue
+            project[-1] = project[-1].removesuffix(".git")
+            if not project[-1]:
+                continue
+            return f"https://gitlab.com/{'/'.join(project)}/-/issues"
 
     return None
 
