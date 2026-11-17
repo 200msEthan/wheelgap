@@ -411,7 +411,30 @@ gaps: fastlib, nativeext, puresdist
 
 The [gap wheel index](https://wheelgap.github.io/wheels/) is a supplementary pip index for packages that do not yet publish every needed wheel on PyPI. Its current coverage is Windows on ARM with CPython 3.14 and free-threaded 3.14t; Linux wheels are not published yet. Check the index page for the latest coverage.
 
-Use pip for this partial index. uv's default [first-index strategy](https://docs.astral.sh/uv/concepts/indexes/#first-index) limits a package to candidates from the first index that contains it, which can hide PyPI versions when an extra index only contains selected wheels.
+It works with pip and uv. uv's default [first-index strategy](https://docs.astral.sh/uv/concepts/indexes/#first-index) takes all of a package's files from the first index that has it, so each package's page on this index also lists every file PyPI has for it (refreshed hourly), plus the gap wheel. With uv, pin only the packages that need it to the index as an explicit index, as `--fix` prints below.
+
+### Which gaps it fills: `--fix`
+
+`wheelgap --fix` checks as usual, then reads the index's list of wheels (one request to wheelgap.github.io that names
+no package) and lists the gaps one of them fills, with how to install it:
+
+```bash
+wheelgap uv.lock -p 3.14t -t win-arm64 --fix
+```
+
+A gap counts only when it's `source` or `missing`, the package is [positively PyPI's](how-it-works.md#pypi-origin), and
+the index has a wheel of exactly that version that the target accepts. The exit code doesn't change: wheelgap still
+reports what PyPI has. For a requirements file or package names it prints the `--extra-index-url` line (with each
+wheel's `--hash`, for requirements that pin hashes); for a uv.lock it prints a `pyproject.toml` snippet that adds the
+index with `explicit = true` and points each package at it in `[tool.uv.sources]`. uv applies `[tool.uv.sources]` only
+to direct dependencies: for a package that comes in through another one, `--fix` also says to list it where that one is
+(the same dependencies, dependency group or extra), and when the lock can't show whether a package is direct, it says
+to list it to be safe. Other lockfiles get a line saying to add the index where the lockfile is made. Only follow the
+pip advice if the packages come from PyPI: pip treats every index alike, and wheelgap can't see a private index set in
+`pip.conf`. uv's `exclude-newer` won't see these packages' files on this index: its pages
+are HTML, which carries no upload times. `--fix` is refused with `--offline`, and reads nothing with `--index-url` or
+a `WHEELGAP_INDEX_URL` mirror. With `--json`, the [`gap_wheels`](output.md#fix) key lists each wheel with its URL and
+SHA-256.
 
 ### GitHub Actions
 

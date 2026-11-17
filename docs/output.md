@@ -307,6 +307,46 @@ or dropped lookup (a note on stderr says so). Like the other hints, it never cha
 code. Quiet text output can't show it (quiet can't be combined with `--explain`). With `--markdown --explain --suggest`,
 suggestions render as a list under the collapsed explanation details.
 
+## Gap wheels (--fix) {#fix}
+
+`--fix` adds a section after the usual output when a wheel on wheelgap's
+[gap wheel index](https://wheelgap.github.io/wheels/) fills a gap: one line per package with the targets it fills (as
+the table labels them), then how to install from the index. For a uv.lock input that's a snippet for
+`pyproject.toml`:
+
+```text
+wheelgap's gap wheel index has wheels PyPI lacks for:
+  tokenizers 0.23.3: win-arm64
+
+To install them with uv, add this to pyproject.toml, then run uv lock:
+
+[[tool.uv.index]]
+name = "wheelgap"
+url = "https://wheelgap.github.io/wheels/simple/"
+explicit = true
+
+[tool.uv.sources]
+tokenizers = { index = "wheelgap" }
+
+tokenizers comes in through transformers; uv only applies [tool.uv.sources] to direct dependencies, so also list "tokenizers" where transformers is (the same dependencies, dependency group or extra).
+If pyproject.toml already has a [tool.uv.sources] table, add these lines to it instead of a second one.
+
+How these wheels are built and checked: https://wheelgap.github.io/wheels/
+```
+
+A requirements file, a `pyproject.toml`, a pip report or package names get the
+`--extra-index-url https://wheelgap.github.io/wheels/simple/` line for a requirements file or `pip install`, each wheel's
+`--hash` for requirements that pin hashes, and a reminder that pip treats every index alike. Other lockfiles
+(`pylock.toml`, `poetry.lock`, `pdm.lock`, `Pipfile.lock`, `pixi.lock`) pin each file, so they get a line saying to add
+the index where the lockfile is made and lock again. Packages wheelgap can't place on PyPI aren't checked, and a note
+on stderr names them. `--markdown` renders the same section with fenced code blocks, and `-q` keeps it. With nothing to fill, a
+note on stderr says so instead (not with `-q`).
+
+With `--json --fix`, the top-level `gap_wheels` list has one object per filled cell: `name`, `version`, `target` (the
+target label), `wheel` (its filename), `url` (where to download it) and `sha256`. It's `[]` when nothing fits, when
+the run uses another index, or when the list couldn't be read, and absent without `--fix`. Like the other hints, it
+never changes a status, the summary or the exit code.
+
 ## --json {#json}
 
 `--json` prints one object. Its shape is described by
