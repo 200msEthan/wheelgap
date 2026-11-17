@@ -10,11 +10,26 @@ wheelgap diff origin/main:uv.lock uv.lock -p 3.13 -t linux-aarch64   # the base 
 
 It exits `1` if there are any, `0` if not, and `2` on bad input. `python -m wheelgap.diff OLD NEW` works the same way.
 
+## Comparing two package versions
+
+To compare a package's whole dependency tree between two releases without a lockfile, give two pinned specs and
+`--deps`:
+
+```bash
+wheelgap diff mcp==2.2.0 mcp==2.3.0 --deps -p 3.14 -t win-arm64
+```
+
+Each side is resolved from PyPI per target, as [`--deps`](cli.md#deps) does, and the two trees are compared as two
+lockfiles are. Each spec is an exact `name==version`, with extras if you like (`mcp[cli]==2.3.0`); a path, URL,
+range or marker is refused (exit 2), and so is a pip or uv index variable such as `PIP_INDEX_URL`, since this mode
+reads PyPI only. If the resolver can't settle on releases, it exits 2 with its message; a package whose dependencies
+it couldn't read is `unknown`, as in a lockfile.
+
 ## Options
 
 | option | meaning |
 | --- | --- |
-| `OLD` | the lockfile before the change: a file, a directory, or git's `REF:PATH` |
+| `OLD` | the lockfile before the change: a file, a directory, or git's `REF:PATH`; with `--deps`, a pinned `name==1.2` |
 | `NEW` | the lockfile after the change, in the same forms |
 | `-p`, `--python VER` | target Python, repeatable (default: the running Python); `next` and `next-t` work too |
 | `-t`, `--target PLATFORM` | target platform, repeatable |
@@ -23,6 +38,7 @@ It exits `1` if there are any, `0` if not, and `2` on bad input. `python -m whee
 | `--distro NAME` | default glibc/musl version from a distro, e.g. `--distro ubuntu-22.04`; doesn't select `-t`, and an explicit `--glibc` or `--musl` wins over it |
 | `--macos X.Y` | minimum macOS for `macos-*` targets (default: 14.0) |
 | `--json` | print one JSON object instead of the text report |
+| `--deps` | `OLD` and `NEW` are pinned releases: resolve and compare their whole trees ([above](#comparing-two-package-versions)) |
 
 The same `-p` and `-t` apply to both lockfiles. `[tool.wheelgap]` and `.python-version` aren't read yet, so pass them
 explicitly. `--advisory` doesn't work with `wheelgap diff` yet.
@@ -42,7 +58,7 @@ Both lockfiles are checked and packages are matched by name. Per target:
   package counts as a new gap, except a uv `virtual` project, which installs nothing.
 - A package listed more than once (a `uv.lock` fork) takes its worst status on each target.
 
-With a dependency graph (`uv.lock`, Poetry 1.x), a new or worse transitive package that builds from source or is
+With a dependency graph (`uv.lock`, Poetry 1.x, or `--deps`), a new or worse transitive package that builds from source or is
 missing names the direct dependency that brings it in, as the main command's table does: `cryptography (via mcp)`,
 or `(via mcp +1)` when more than one does. The Action's PR comment shows the same.
 
