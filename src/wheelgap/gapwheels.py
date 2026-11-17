@@ -312,6 +312,39 @@ LOCK_CAVEAT = (
 UV_MERGE = "If pyproject.toml already has a [tool.uv.sources] table, add these lines to it instead of a second one."
 
 
+# The inputs --print-gap-wheel-snippet takes, one at a time: a uv.lock, a requirements file, or package names on the
+# command line (kind None; the CLI refuses --from-log and --dist, the other inputs of that kind, before this).
+SNIPPET_KINDS = ("uv", "requirements", None)
+
+
+def project_snippet_lines(fills: list[Fill], source: Source, multi_py: bool) -> list[str]:
+    """--fix --print-gap-wheel-snippet: the configuration alone, to copy by hand (nothing is written), for `source`,
+    one of SNIPPET_KINDS (the CLI refuses the rest before checking). Empty when no gap wheel fills a gap."""
+    if not fills:
+        return []
+    listed, config, notes, _ = _parts(fills, multi_py)
+    about = [f"# Gap wheels are {UNOFFICIAL}: {ABOUT}", *(f"# fills: {line}" for line in listed)]
+    if source.kind == "uv":
+        return [
+            f"# {source.uv_pyproject or 'pyproject.toml'} (uv): add this, then run uv lock.",
+            *about,
+            *config,
+            *(f"# {note}." for note in notes),
+            f"# {UV_MERGE}",
+        ]
+    where = "add this line to it" if source.kind == "requirements" else "add this line to a requirements file"
+    return [
+        f"# {source.label} (pip): {where}, or pass it to pip install.",
+        *about,
+        f"# {PIP_CAVEAT}",
+        f"--extra-index-url {INDEX}",
+        *(
+            f"# If the requirements pin hashes, add --hash=sha256:{sha} to the {req} line."
+            for req, sha in _hashes(fills)
+        ),
+    ]
+
+
 def text_lines(fills: list[Fill], multi_py: bool) -> list[str]:
     """--fix's section of the text output (empty when nothing is fillable)."""
     if not fills:

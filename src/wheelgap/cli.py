@@ -308,6 +308,12 @@ def make_parser() -> argparse.ArgumentParser:
         "not with --offline, and off with --index-url or a WHEELGAP_INDEX_URL mirror)",
     )
     p.add_argument(
+        "--print-gap-wheel-snippet",
+        action="store_true",
+        help="with --fix, print only the configuration that installs the gap wheels, for one uv.lock, requirements "
+        "file or package names (other inputs are refused); it never writes to your project",
+    )
+    p.add_argument(
         "-q",
         "--quiet",
         action=argparse.BooleanOptionalAction,
@@ -1699,6 +1705,31 @@ def _main(argv: list[str], project: Path | None = None) -> int:
     args = parser.parse_args(argv)
     if args.json and args.markdown:
         parser.error("--json and --markdown can't be used together")
+    if args.print_gap_wheel_snippet:
+        if not args.fix:
+            parser.error("--print-gap-wheel-snippet needs --fix")
+        given = [
+            flag
+            for flag, value in (
+                ("--json", args.json),
+                ("--markdown", args.markdown),
+                ("--explain", args.explain),
+                ("--all", args.all),
+                ("--from-log", args.from_log is not None),
+                ("--dist", bool(args.dist)),
+                ("--junit", args.junit is not None),
+                ("--sarif", args.sarif is not None),
+                ("--badge", args.badge is not None),
+                ("--write-constraints", args.write_constraints is not None),
+                ("--github-annotations", args.github_annotations),
+            )
+            if value
+        ]
+        if given:
+            parser.error(
+                "--print-gap-wheel-snippet prints only the configuration for one uv.lock, requirements file or "
+                f"package names, so it can't be used with {', '.join(given)}"
+            )
     if args.list_targets and args.markdown:
         parser.error("--list-targets has no Markdown form (use --json)")
     if args.offline and args.online:
@@ -1903,6 +1934,12 @@ def _main(argv: list[str], project: Path | None = None) -> int:
         else:
             sources = (
                 [parse_dist(Path(args.dist))] if args.dist else load_inputs(args.inputs or ["."], args.environment)
+            )
+        if args.print_gap_wheel_snippet and (len(sources) != 1 or sources[0].kind not in gapwheels.SNIPPET_KINDS):
+            # Decided from the inputs, before any lookup, so the exit code doesn't depend on what the index has.
+            raise SourceError(
+                f"--print-gap-wheel-snippet has no snippet for {', '.join(s.label for s in sources)}: it takes one "
+                "uv.lock, one requirements file or package names on the command line (--fix alone covers the others)"
             )
         for source in sources:
             check_report_targets(source, targets)
@@ -2350,6 +2387,12 @@ def _main(argv: list[str], project: Path | None = None) -> int:
         if args.fix
         else None
     )
+
+    if args.print_gap_wheel_snippet:  # one input of gapwheels.SNIPPET_KINDS, checked when it was read
+        multi_py = len({t.python for t in targets}) > 1
+        if snippet := gapwheels.project_snippet_lines(fills or [], sources[0], multi_py):
+            print("\n".join(snippet))
+        return code
 
     issues_urls = explain_issues_urls(rows, sources, index_url) if args.explain else None
 

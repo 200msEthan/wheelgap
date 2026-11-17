@@ -368,6 +368,31 @@ report or package names) it gives the `pip install --extra-index-url` command; f
 `--fix` section, since that lockfile's own tool has to pick the index up. With `--json`, each package gets
 [`gap_wheel`](output.md#fix).
 
+### `--print-gap-wheel-snippet` {#print-gap-wheel-snippet}
+
+With [`--fix`](#fix) (**after 0.13.0**), print only the configuration that installs the gap wheels, instead of the
+usual output, for you to copy into your project. It never writes to your project. Comment lines say the wheels are unofficial
+(built by wheelgap from the PyPI sdist, not by the package's maintainers), link to how they're built, and name each
+package and the targets it fills. The exit code is the check's own, so a run with gaps still exits 1 after printing a
+snippet; when no gap wheel fits, stdout is empty.
+
+- For one requirements file or package names on the command line: the `--extra-index-url` line, with pip's
+  dependency-confusion caveat, and for each wheel the `--hash=sha256:` to add to its line if the requirements pin
+  hashes.
+- For one uv.lock: the `[[tool.uv.index]]` (with `explicit = true`) and `[tool.uv.sources]` entries for
+  `pyproject.toml`, with a note for each package uv won't take from the index until it's listed as a direct
+  dependency. Add them to an existing `[tool.uv.sources]` table rather than a second one, then run `uv lock`.
+
+It refuses, with exit code 2 and before any lookup, more than one input and any other input: `pyproject.toml`,
+`pylock.toml`, `poetry.lock`, `pdm.lock`, `Pipfile.lock`, `pixi.lock` and a pip report. Use `--fix` alone for
+those. It can't be used with `--explain` (and its add-ons), `--all`, `--from-log`, `--dist`, `--json`, `--markdown`, `--junit`, `--sarif`, `--badge`,
+`--write-constraints` or `--github-annotations`.
+
+```console
+wheelgap requirements.txt -p 3.14t -t win-arm64 --fix --print-gap-wheel-snippet
+wheelgap uv.lock -p 3.14t -t win-arm64 --fix --print-gap-wheel-snippet
+```
+
 ### `-q`, `--quiet`, `--no-quiet` {#quiet}
 
 Print only the gap summary and the affected package names. Clean runs without ignored packages are silent, and JSON
