@@ -23,7 +23,7 @@ from packaging.tags import Tag
 from packaging.utils import InvalidWheelFilename, canonicalize_name, parse_wheel_filename
 from packaging.version import InvalidVersion, Version
 
-from . import origin, pypi
+from . import cache, origin, pypi
 from .check import Row, Status, wheel_tags
 from .sources import Source
 from .targets import Target
@@ -97,13 +97,21 @@ def parse(data: object) -> list[GapWheel] | None:
     return [w for w in map(_entry, data["wheels"]) if w is not None]
 
 
-def look_up() -> list[GapWheel] | None:
-    """The gap wheel list, or None if it couldn't be fetched or read."""
+def look_up(*, read_cache: bool = True, write_cache: bool = True) -> list[GapWheel] | None:
+    """The gap wheel list, or None if it couldn't be fetched or read. A list parse() accepts with at least one usable
+    entry is kept in the 24-hour cache (--no-cache: neither read nor saved; --online: fetched again, then saved)."""
+    if read_cache:
+        cached = cache.load_gap_wheels(pypi.GAP_WHEELS_URL)
+        if cached is not None and (wheels := parse(cached)):  # as saved: a list with a usable entry
+            return wheels
     try:
         data = pypi.fetch_gap_wheels()
-    except Exception:  # unreachable, a timeout, an HTTP error, a body that isn't JSON...
+    except Exception:  # unreachable, a timeout, an HTTP error, a body that isn't JSON or is too big...
         return None
-    return parse(data)
+    wheels = parse(data)
+    if wheels and write_cache:
+        cache.save_gap_wheels(pypi.GAP_WHEELS_URL, data)
+    return wheels
 
 
 @dataclass(frozen=True)
@@ -174,6 +182,33 @@ def to_json(fills: list[Fill], multi_py: bool) -> list[dict]:
         }
         for f in fills
     ]
+
+
+UNOFFICIAL = "unofficial, built by wheelgap from the PyPI sdist; not from the package's maintainers"
+
+
+def pip_install(fill: Fill) -> str | None:
+    """The pip command that installs this fill's release from the index, for an input pip installs from as it is
+    (PIP_KINDS); None for a lockfile, which needs the --fix section's advice instead."""
+    if fill.source.kind not in PIP_KINDS:
+        return None
+    return f"pip install --extra-index-url {INDEX} {fill.row.package.name}=={fill.row.package.version}"
+
+
+def explain_lines(fills: list[Fill], multi_py: bool) -> list[str]:
+    """--explain --fix: the hint under a release's first filled target. `fills`: all of that release's, which come
+    from one input."""
+    on = ", ".join(dict.fromkeys(f.target.label(multi_py) for f in fills))
+    how = pip_install(fills[0]) or "see the gap wheel section below for how to use it"
+    return [f"gap wheel for {on}: {UNOFFICIAL}", f"  {how}"]
+
+
+def explain_json(fill: Fill) -> dict[str, str]:
+    """--json --explain --fix: one target's entry in a package's gap_wheel (`install` only for PIP_KINDS)."""
+    out = {"wheel": fill.wheel.wheel, "url": fill.wheel.url, "sha256": fill.wheel.sha256}
+    if command := pip_install(fill):
+        out["install"] = command
+    return out
 
 
 def _by_package(fills: list[Fill]) -> dict[tuple[str, str], list[Fill]]:

@@ -1,7 +1,8 @@
 """A small on-disk cache of pinned index lookups (/<name>/<version>/json), so a repeat run needn't ask again,
 of --deps' wheel metadata files (each release's Requires-Dist), of --conda-forge lookups (a version's conda-forge
 builds, cut down to what matching needs), of --notes lookups (the coverage tracker's notes and build lab results for
-a package), and of --build-info answers (what a release's sdist says about its build).
+a package), of --build-info answers (what a release's sdist says about its build), and of --fix's gap wheel list (the
+whole document, once gapwheels.parse has accepted it).
 
 A cache that can't be read or written is only ever a miss: it never fails a run.
 """
@@ -188,6 +189,19 @@ def load_build(index: str, name: str, version: str, sha256: str) -> dict | None:
 def save_build(index: str, name: str, version: str, sha256: str, answer: dict | None) -> None:
     """Store what a release's sdist says about its build, or None when it gives no answer for good."""
     _save(_build_key(index, sha256), name, version, "build", {"answer": answer})
+
+
+def load_gap_wheels(url: str) -> dict | None:
+    """--fix: the gap wheel list read from `url` (pypi.GAP_WHEELS_URL), or None for a miss. gapwheels.parse checks it
+    again."""
+    doc = _load(f"gap-wheels-v1 {url}", "list", "schema-1", "document")
+    return doc if isinstance(doc, dict) and doc.get("schema") == 1 and isinstance(doc.get("wheels"), list) else None
+
+
+def save_gap_wheels(url: str, doc: dict) -> None:
+    """Store the gap wheel list read from `url`, once gapwheels.parse has accepted it (a failed fetch saves nothing,
+    so it never replaces the last good list)."""
+    _save(f"gap-wheels-v1 {url}", "list", "schema-1", "document", doc)
 
 
 def load_notes(source: str, name: str) -> list | None:

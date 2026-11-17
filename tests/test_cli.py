@@ -2153,7 +2153,7 @@ JSON_TYPES = {"object": dict, "array": list, "string": str, "integer": int, "boo
 
 def _check_schema(value, schema, root, where="$"):
     """Validate `value` against the JSON Schema keywords the output schema uses, and no others."""
-    known = {"$ref", "type", "enum", "minimum", "required", "properties", "additionalProperties", "items"}
+    known = {"$ref", "type", "enum", "minimum", "required", "properties", "additionalProperties", "items", "minItems"}
     annotations = {"$schema", "$id", "$defs", "title", "description"}
     assert set(schema) <= known | annotations, f"{where}: the test doesn't check {set(schema) - known - annotations}"
     if "$ref" in schema:
@@ -2171,6 +2171,8 @@ def _check_schema(value, schema, root, where="$"):
         assert value in schema["enum"], (where, value)
     if "minimum" in schema:
         assert value >= schema["minimum"], (where, value)
+    if "minItems" in schema and isinstance(value, list):
+        assert len(value) >= schema["minItems"], (where, value)
     if isinstance(value, dict):
         properties = schema.get("properties", {})
         assert set(schema.get("required", [])) <= set(value), (where, sorted(value))
@@ -2235,6 +2237,7 @@ def _assert_matches_output_schema(data):
             "conda_forge",
             "suggest",
             "last_with_wheel",
+            "gap_wheel",
         }
         assert isinstance(pkg["name"], str) and pkg["name"]
         assert pkg["version"] is None or isinstance(pkg["version"], str)
@@ -2273,6 +2276,15 @@ def _assert_matches_output_schema(data):
             assert set(pkg["suggest"]) <= set(pkg["rejected"]) and all(
                 isinstance(v, str) for v in pkg["suggest"].values()
             )
+        if "gap_wheel" in pkg:
+            assert set(pkg["gap_wheel"]) <= set(pkg.get("rejected", {}))
+            for label, wheel in pkg["gap_wheel"].items():
+                assert pkg["results"][label] in ("source", "missing")
+                assert {"wheel", "url", "sha256"} <= set(wheel) <= {"wheel", "url", "sha256", "install"}
+                assert wheel["sha256"] and wheel["wheel"].endswith(".whl")
+                assert wheel.get("install", "pip install --extra-index-url ").startswith(
+                    "pip install --extra-index-url "
+                )
         if "last_with_wheel" in pkg:  # an older release for gap targets no newer one has a wheel for
             assert "suggest" in pkg and not set(pkg["last_with_wheel"]) & set(pkg["suggest"])
             assert set(pkg["last_with_wheel"]) <= set(pkg["rejected"])
