@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `pyproject.toml` inputs read PEP 735 dependency groups with `--group NAME` or `--only-group NAME`, including nested groups and project-extra self-references; no group is selected by default. (#506, thanks [@kushaldave002](https://github.com/kushaldave002))
 - The pre-commit hook also runs when `pyproject.toml`, `uv.toml`, or `.python-version` changes, so edits to `[tool.wheelgap]`, `[tool.uv]`, or the default Python trigger a check without waiting for a lockfile change. (#500, thanks [@kushaldave002](https://github.com/kushaldave002))
 - `wheelgap diff` accepts `--ios X.Y` and `--android-api N` to set the minimum iOS version and Android API level for mobile targets, matching the main command. (#499, thanks [@kushaldave002](https://github.com/kushaldave002))
 - A missing `*.in` requirements file now reports `no such file` instead of treating its name as a PyPI package; input docs also list pip JSON reports. (#497, thanks [@AdityaSreevatsaK](https://github.com/AdityaSreevatsaK))
