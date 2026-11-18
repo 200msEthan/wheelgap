@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `--from-log` reads Poetry build failures and PDM verbose install logs, refusing ambiguous sources and incomplete diagnostics. (#510, thanks [@kushaldave002](https://github.com/kushaldave002))
 - `--deps` fetches project pages and dependency metadata ahead in parallel while preserving resolution results and request counts. (#513, thanks [@kushaldave002](https://github.com/kushaldave002))
 - `--gitlab-code-quality PATH` writes wheel gaps as GitLab Code Quality findings on their lockfile lines, with stable fingerprints and severities that follow advisory targets and `--fail-on`. (#509, thanks [@kushaldave002](https://github.com/kushaldave002))
 - wheelgap reads conda `environment.yml` and `environment.yaml` files (and other `environment*.yml` names, by explicit path), checking the `pip:` list as a requirements file (including `-r` includes, markers and `--index-url` handling) and skipping conda entries as `conda`. `#` comments are read, and `--fix` gives the pip advice for them. (#503, thanks [@kushaldave002](https://github.com/kushaldave002))
