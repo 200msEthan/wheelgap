@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `--deps` fetches project pages and dependency metadata ahead in parallel while preserving resolution results and request counts. (#513, thanks [@kushaldave002](https://github.com/kushaldave002))
 - `--gitlab-code-quality PATH` writes wheel gaps as GitLab Code Quality findings on their lockfile lines, with stable fingerprints and severities that follow advisory targets and `--fail-on`. (#509, thanks [@kushaldave002](https://github.com/kushaldave002))
 - wheelgap reads conda `environment.yml` and `environment.yaml` files (and other `environment*.yml` names, by explicit path), checking the `pip:` list as a requirements file (including `-r` includes, markers and `--index-url` handling) and skipping conda entries as `conda`. `#` comments are read, and `--fix` gives the pip advice for them. (#503, thanks [@kushaldave002](https://github.com/kushaldave002))
 - MCP `suggest_targets` reads a project's workflows and Dockerfiles to suggest platforms and Python versions, with file and line references and unreadable inputs, without changing files or contacting an index. It refuses the filesystem root and the home folder, and `--suggest-targets` and the tool now list a workflow or Dockerfile that is a symlink out of the project as unreadable instead of reading it. (#505, thanks [@kushaldave002](https://github.com/kushaldave002))
