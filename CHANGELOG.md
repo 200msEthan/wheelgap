@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `--suggest-targets` reads `.gitlab-ci.yml`: each job's image (or `default:` image) for the CPU of its GitLab.com hosted runner tag, untagged jobs as the default `saas-linux-small-amd64` runner, and `macos-N-xcode-M` images on the macOS runners as `macos-arm64` with that macOS version. A job with `extends:`, `inherit:`, `trigger:`, `parallel: matrix:`, an unknown tag or an image it can't read is listed as unreadable on its own; `include:` and YAML anchors refuse the whole file. (#511, thanks [@kushaldave002](https://github.com/kushaldave002))
 - `--from-log` reads Poetry build failures and PDM verbose install logs, refusing ambiguous sources and incomplete diagnostics. (#510, thanks [@kushaldave002](https://github.com/kushaldave002))
 - `--deps` fetches project pages and dependency metadata ahead in parallel while preserving resolution results and request counts. (#513, thanks [@kushaldave002](https://github.com/kushaldave002))
 - `--gitlab-code-quality PATH` writes wheel gaps as GitLab Code Quality findings on their lockfile lines, with stable fingerprints and severities that follow advisory targets and `--fail-on`. (#509, thanks [@kushaldave002](https://github.com/kushaldave002))
