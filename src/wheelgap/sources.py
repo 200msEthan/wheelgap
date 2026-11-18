@@ -161,6 +161,8 @@ class Source:
     pyproject_dynamic_extras: bool = False
     # PEP 735 groups, expanded only when explicitly selected.
     pyproject_groups: dict[str, object] = field(default_factory=dict)
+    # A pyproject.toml with a [dependency-groups] table and no [project] table.
+    pyproject_groups_only: bool = False
     # pyproject.toml only: the canonical [project] name, to spot `myproject[extra]` self-references.
     pyproject_name: str | None = None
     # poetry.lock only: each package's [[package]] table, kept so --group/--only-group/--no-dev can pick packages
@@ -1252,7 +1254,7 @@ def _nearby_config_names_an_index(path: Path) -> bool:
 
 
 def parse_pyproject(path: Path) -> Source:
-    """Read a library's [project] dependencies as requirement lines."""
+    """Read [project] dependencies and record available PEP 735 groups."""
     try:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
     except tomllib.TOMLDecodeError as e:
@@ -1300,10 +1302,24 @@ def parse_script(path: Path) -> Source:
     )
 
 
+def _builds_a_package(data: dict, path: Path) -> bool:
+    """Whether a pyproject.toml with no [project] table still describes a buildable project: a [build-system]
+    table, a setup.py or setup.cfg beside it, [tool.flit.metadata], or PDM-legacy [tool.pdm] dependencies."""
+    if "build-system" in data or (path.parent / "setup.py").exists() or (path.parent / "setup.cfg").exists():
+        return True
+    tool = data.get("tool")
+    if not isinstance(tool, dict):
+        return False
+    flit = tool.get("flit")
+    pdm = tool.get("pdm")
+    return (isinstance(flit, dict) and "metadata" in flit) or (isinstance(pdm, dict) and "dependencies" in pdm)
+
+
 def _project_source(data: dict, path: Path, script: bool = False) -> Source:
     """Shared requirement and provenance handling for project and script metadata (`script`: a # /// script block,
     which errors name instead of [project])."""
-    project = data.get("project")
+    groups_only = "project" not in data and isinstance(data.get("dependency-groups"), dict)
+    project = {} if groups_only else data.get("project")
     if not isinstance(project, dict):
         raise SourceError(f"{path}: no [project] table, so there are no dependencies to read")
     dynamic = project.get("dynamic", [])
@@ -1316,7 +1332,8 @@ def _project_source(data: dict, path: Path, script: bool = False) -> Source:
         )
     if not script and not project.get("dependencies") and not project.get("optional-dependencies"):
         # poetry-core 2 builds [tool.poetry.dependencies] into the package whenever [project] lists no dependencies
-        # or optional-dependencies (missing or empty: DependencyGroup.dependencies' "legacy mode").
+        # or optional-dependencies (missing or empty: DependencyGroup.dependencies' "legacy mode"). A groups-only file
+        # with them is a Poetry project too: --group would leave its dependencies out.
         tool = data.get("tool")
         poetry = tool.get("poetry") if isinstance(tool, dict) else None
         poetry_deps = poetry.get("dependencies") if isinstance(poetry, dict) else None
@@ -1325,6 +1342,13 @@ def _project_source(data: dict, path: Path, script: bool = False) -> Source:
                 f"{path}: the dependencies are in [tool.poetry.dependencies], not [project] dependencies, "
                 "so wheelgap can't read them; check poetry.lock instead"
             )
+    if groups_only and _builds_a_package(data, path):
+        # A setuptools, flit or PDM-legacy project keeps its dependencies outside [project]: checking only a group
+        # would leave them out, and a group entry like `mypkg[test]` would look up an unrelated PyPI package.
+        raise SourceError(
+            f"{path}: no [project] table; the project's dependencies are in setup.py/setup.cfg or its build "
+            "backend's settings, which wheelgap doesn't read; check a lockfile instead"
+        )
     dependencies = project.get("dependencies", [])
     if not isinstance(dependencies, list) or not all(isinstance(d, str) for d in dependencies):
         where = "the # /// script block's dependencies" if script else "[project] dependencies"
@@ -1356,6 +1380,7 @@ def _project_source(data: dict, path: Path, script: bool = False) -> Source:
         path.name,
         pyproject_extras=extras,
         pyproject_groups=normalized_groups,
+        pyproject_groups_only=groups_only,
         pyproject_dynamic_extras="optional-dependencies" in dynamic,
         pypi_only=not (_names_an_index(data) or _nearby_config_names_an_index(path)),
     )
