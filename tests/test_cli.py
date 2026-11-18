@@ -4286,3 +4286,137 @@ def test_json_explain_direct_without_a_graph_and_without_explain(capsys, tmp_pat
     code, out, _ = run(capsys, str(tmp_path / "uv.lock"), "-p", "3.13", "-t", "linux-x86_64", "--offline", "--json")
     assert code == 1
     assert all("direct" not in p for p in json.loads(out)["packages"])
+
+
+SCRIPT_METADATA = '# /// script\n# dependencies = ["nowheels==0.9"]\n# requires-python = ">=3.13"\n# ///\n'
+
+
+def test_script_input_checks_dependencies(capsys, fake_pypi, tmp_path):
+    script = tmp_path / "example.py"
+    script.write_text(SCRIPT_METADATA + 'print("hello")\n', encoding="utf-8")
+    code, out, err = run(capsys, str(script), "-p", "3.13", "-t", "win-arm64")
+    assert code == 1
+    assert "nowheels" in out.lower()
+    assert "direct dependencies only" in err
+    assert "add --deps" in err
+
+
+@pytest.mark.parametrize(
+    "text, error",
+    [
+        ('print("hello")\n', "no # /// script block"),
+        (SCRIPT_METADATA + "\n" + SCRIPT_METADATA, "more than one # /// script block"),
+        ("# /// script\n# dependencies = [\n# ///\n", "invalid TOML in the # /// script block"),
+        ("# /// script\n# dependencies = 123\n# ///\n", "the # /// script block's dependencies must be a list"),
+    ],
+)
+def test_script_input_errors(capsys, fake_pypi, tmp_path, text, error):
+    script = tmp_path / "example.py"
+    script.write_text(text, encoding="utf-8")
+    code, out, err = run(capsys, str(script), "-p", "3.13", "-t", "win-arm64")
+    assert code == 2
+    assert error in err
+    assert "[project]" not in err and "pyproject.toml" not in err
+    assert fake_pypi == []
+
+
+def test_script_block_text_inside_another_block_isnt_read(capsys, fake_pypi, tmp_path):
+    # The specification's regex matches whole blocks: a `# /// script` line in another block's content is content.
+    script = tmp_path / "example.py"
+    script.write_text(
+        "# /// example\n"
+        "# This is how a script declares its dependencies:\n"
+        "# /// script\n"
+        '# dependencies = ["private-name"]\n'
+        "# ///\n"
+        "# ///\n"
+        "\n" + SCRIPT_METADATA,
+        encoding="utf-8",
+    )
+    code, out, err = run(capsys, str(script), "-p", "3.13", "-t", "win-arm64")
+    assert code == 1
+    assert "nowheels" in out.lower()
+    assert all("private-name" not in url for url in fake_pypi)
+
+
+def test_script_with_a_bom_is_read(capsys, fake_pypi, tmp_path):
+    script = tmp_path / "example.py"
+    script.write_bytes(b"\xef\xbb\xbf" + SCRIPT_METADATA.encode("utf-8"))
+    code, out, err = run(capsys, str(script), "-p", "3.13", "-t", "win-arm64")
+    assert code == 1
+    assert "nowheels" in out.lower()
+
+
+def test_script_that_isnt_utf8_is_an_input_error(capsys, fake_pypi, tmp_path):
+    script = tmp_path / "example.py"
+    script.write_bytes(SCRIPT_METADATA.encode("utf-8") + "# café\n".encode("latin-1"))
+    code, out, err = run(capsys, str(script), "-p", "3.13", "-t", "win-arm64")
+    assert code == 2
+    assert "isn't UTF-8" in err
+    assert "Traceback" not in err
+    assert fake_pypi == []
+
+
+@pytest.mark.parametrize(
+    "flag", [["--group", "dev"], ["--only-group", "dev"], ["--no-dev"], ["--extra", "test"], ["--all-extras"]]
+)
+def test_script_refuses_extras_and_groups(capsys, fake_pypi, tmp_path, flag):
+    script = tmp_path / "example.py"
+    script.write_text(SCRIPT_METADATA, encoding="utf-8")
+    code, out, err = run(capsys, str(script), *flag, "-p", "3.13", "-t", "win-arm64")
+    assert code == 2
+    assert "don't apply to a script" in err
+    assert "pyproject.toml" not in err
+    assert fake_pypi == []
+
+
+def test_script_input_requires_python_note(capsys, fake_pypi, tmp_path):
+    script = tmp_path / "example.py"
+    script.write_text(SCRIPT_METADATA, encoding="utf-8")
+    code, out, err = run(capsys, str(script), "-p", "3.12", "-p", "3.13", "-t", "win-arm64")
+    assert code == 1
+    assert "requires Python >=3.13, which leaves out Python 3.12" in err
+
+
+def test_script_input_private_index_is_not_pypi_only(tmp_path):
+    from wheelgap.sources import load_file
+
+    script = tmp_path / "example.py"
+    script.write_text(
+        SCRIPT_METADATA.replace("# ///\n", '# [[tool.uv.index]]\n# url = "https://private.example/simple"\n# ///\n'),
+        encoding="utf-8",
+    )
+    assert not load_file(script).pypi_only
+
+
+def test_missing_py_name_is_still_a_package(capsys, fake_pypi, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    code, out, err = run(capsys, "discord.py", "-p", "3.13", "-t", "win-arm64")
+    assert code == 1  # not on the fake index: unknown, not an input error
+    assert "https://pypi.org/pypi/discord-py/json" in fake_pypi
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_script_metadata_ignores_unclosed_and_other_blocks(capsys, fake_pypi, tmp_path, newline):
+    script = tmp_path / "example.py"
+    text = (
+        '# /// other\n# dependencies = ["private-name"]\n# ///\n\n' + SCRIPT_METADATA + "\n# /// script\n# incomplete"
+    )
+    script.write_bytes(text.replace("\n", newline).encode("utf-8"))
+    code, out, err = run(capsys, str(script), "-p", "3.13", "-t", "win-arm64")
+    assert code == 1
+    assert "nowheels" in out.lower()
+    assert all("private-name" not in url for url in fake_pypi)
+
+
+def test_script_deps_refuses_private_index(capsys, fake_pypi, tmp_path):
+    script = tmp_path / "example.py"
+    script.write_text(
+        SCRIPT_METADATA.replace("# ///\n", '# [[tool.uv.index]]\n# url = "https://private.example/simple"\n# ///\n'),
+        encoding="utf-8",
+    )
+    code, out, err = run(capsys, str(script), "--deps", "-p", "3.13", "-t", "win-arm64")
+    assert code == 2
+    assert "the script configures an installer index or source; --deps uses only PyPI" in err
+    assert "lockfile" not in err  # wheelgap can't read example.py.lock
+    assert fake_pypi == []

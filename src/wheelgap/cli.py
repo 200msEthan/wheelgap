@@ -153,8 +153,8 @@ def make_parser() -> argparse.ArgumentParser:
         metavar="INPUT",
         help=(
             "uv.lock, pylock.toml, poetry.lock, Pipfile.lock, pixi.lock, requirements.txt, report.json, "
-            "environment.yml (pip packages), pyproject.toml (direct dependencies), a directory, or package specs "
-            "(default: .)"
+            "environment.yml (pip packages), pyproject.toml (direct dependencies), a script.py's # /// script block "
+            "(PEP 723), a directory, or package specs (default: .)"
         ),
     )
     p.add_argument(
@@ -282,8 +282,9 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--deps",
         action="store_true",
-        help="for package names, requirements files or pyproject.toml, also check what they install, resolved "
-        "per target from PyPI's metadata (looks each dependency up on pypi.org; a lockfile is exact)",
+        help="for package names, requirements files, pyproject.toml or a script's # /// script block, also check "
+        "what they install, resolved per target from PyPI's metadata (looks each dependency up on pypi.org; a "
+        "lockfile is exact)",
     )
     p.add_argument(
         "--suggest",
@@ -1976,6 +1977,13 @@ def _main(argv: list[str], project: Path | None = None) -> int:
         pyproject_sources = [s for s in sources if s.pyproject_extras is not None]
         lock_sources = [s for s in sources if s.pyproject_extras is None]
         if pyproject_sources:
+            if any(s.kind == "script" for s in pyproject_sources) and (
+                args.group is not None or args.only_group or args.no_dev or args.extra or args.all_extras
+            ):
+                raise SourceError(
+                    "--extra, --all-extras, --group, --only-group and --no-dev don't apply to a script: "
+                    "its # /// script block has no extras or dependency groups"
+                )
             if args.no_dev:
                 raise SourceError(
                     "--no-dev doesn't apply to pyproject.toml: no dependency group is selected by default"
@@ -2010,8 +2018,8 @@ def _main(argv: list[str], project: Path | None = None) -> int:
             dependency_sources = [s for s in sources if s.specs or s.pyproject_extras is not None]
             if not dependency_sources:
                 raise SourceError(
-                    "--deps applies to package names on the command line, requirements files or pyproject.toml; "
-                    "a lockfile already lists what it installs"
+                    "--deps applies to package names on the command line, requirements files, pyproject.toml or a "
+                    "script's # /// script block; a lockfile already lists what it installs"
                 )
             if offline:
                 raise SourceError(
@@ -2027,15 +2035,18 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 # can't see, so it refuses rather than answer for the wrong index.
                 if not (source.requirements or source.pyproject_extras is not None):
                     continue
+                # wheelgap can't read a script's lock (example.py.lock), so a script gets no lockfile advice.
+                instead = "" if source.kind == "script" else ", so check a lockfile instead"
                 if not source.pypi_only:
+                    what = "the script" if source.kind == "script" else "the project"
                     raise SourceError(
-                        f"{source.label}: the project configures an installer index or source; "
-                        "--deps uses only PyPI, so check a lockfile instead"
+                        f"{source.label}: {what} configures an installer index or source; "
+                        f"--deps uses only PyPI{instead}"
                     )
                 if (env := origin.index_env()) is not None:
                     raise SourceError(
-                        f"{source.label}: {env} may point pip or uv at another index, and --deps uses only PyPI, "
-                        "so check a lockfile instead"
+                        f"{source.label}: {env} may point pip or uv at another index, and --deps uses only PyPI"
+                        + instead
                     )
             # Wheel metadata files are cached on disk like pinned lookups: --online asks again, --no-cache skips it.
             resolver = Resolver(read_cache=not (args.no_cache or args.online), write_cache=not args.no_cache)
@@ -2140,8 +2151,13 @@ def _main(argv: list[str], project: Path | None = None) -> int:
             if source.deps_paths is None:
                 print(
                     f"wheelgap: note: {source.label} lists direct dependencies only; "
-                    "their own dependencies aren't checked (use a lockfile for that, or add --deps for PyPI), "
-                    "and ranges were checked at the newest matching release",
+                    + (
+                        "their own dependencies aren't checked "
+                        "(add --deps to check what the script installs from PyPI), "
+                        if source.kind == "script"
+                        else "their own dependencies aren't checked (use a lockfile for that, or add --deps for PyPI), "
+                    )
+                    + "and ranges were checked at the newest matching release",
                     file=sys.stderr,
                 )
             if source.requires_python and not quiet:  # the answer is right either way, so -q drops these
