@@ -213,6 +213,11 @@ def make_parser() -> argparse.ArgumentParser:
         "(a strict subset of Dockerfiles: anything else that may install packages is an error naming its line)",
     )
     p.add_argument(
+        "--dockerfile-context",
+        metavar="DIR",
+        help="with --dockerfile-inputs, the folder the build context starts from (default: the Dockerfile's folder)",
+    )
+    p.add_argument(
         "--build-arg",
         action="append",
         metavar="NAME=VALUE",
@@ -1860,6 +1865,15 @@ def _main(argv: list[str], project: Path | None = None) -> int:
         parser.error("--notes only adds to --explain; pass --explain too")
     if args.dist and args.inputs:
         parser.error("--dist DIR takes no other inputs")
+    if args.dockerfile_context is not None:
+        if not args.dockerfile_inputs:
+            parser.error("--dockerfile-context is only used with --dockerfile-inputs; pass --dockerfile-inputs too")
+        # An empty DIR (an unset variable in a script) must not quietly fall back to the Dockerfile's folder, where
+        # a different requirements.txt may sit, and Path("") would be the current folder.
+        if not args.dockerfile_context:
+            parser.error("--dockerfile-context: DIR is empty; pass the build context's folder (. for this one)")
+        if not Path(args.dockerfile_context).is_dir():
+            parser.error(f"--dockerfile-context: not a directory: {args.dockerfile_context}")
     if args.dockerfile_inputs:
         if not args.dockerfile:
             parser.error("--dockerfile-inputs reads what --dockerfile installs; pass --dockerfile too")
@@ -1872,11 +1886,17 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 f"so it can't be used with {', '.join(given)}"
             )
     installs: list[tuple[int, Path]] = []
-    # Where [tool.wheelgap] and .python-version are looked for: the Dockerfile's folder when it supplies the inputs.
-    config_inputs = [str(Path(args.dockerfile).parent)] if args.dockerfile_inputs else args.inputs
+    # Where [tool.wheelgap] and .python-version are looked for: the Dockerfile's folder (or --dockerfile-context DIR)
+    # when it supplies the inputs.
+    if args.dockerfile_inputs:
+        context_dir = Path(args.dockerfile_context) if args.dockerfile_context else Path(args.dockerfile).parent
+        config_inputs = [str(context_dir)]
+    else:
+        config_inputs = args.inputs
     try:
         if args.dockerfile_inputs:
-            installs = dockerfile_requirements(Path(args.dockerfile), build_args)
+            context = Path(args.dockerfile_context) if args.dockerfile_context else None
+            installs = dockerfile_requirements(Path(args.dockerfile), build_args, context=context)
             args.inputs = [str(requirements) for _, requirements in installs]
         if args.clear_cache:
             folder, count = cache.clear()
