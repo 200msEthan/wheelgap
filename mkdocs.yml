@@ -80,6 +80,7 @@ nav:
       - Buzz: case-studies/buzz.md
       - Aider: case-studies/aider.md
       - Textual: case-studies/textual.md
+      - Poetry: case-studies/poetry.md
       - pydantic: case-studies/pydantic.md
       - HERD: case-studies/herd.md
   - Integrations:
