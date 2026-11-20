@@ -119,6 +119,11 @@ _SYNTAX_DIRECTIVE_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9]*)[\t\n\f\r ]*=[\t\n\f\r
 _DOCKERFILE_SYNTAX_RE = re.compile(
     r"(?:docker\.io/)?docker/dockerfile(?::(?:1|latest|labs|1-labs|1\.(\d+)(?:\.\d+)?(?:-rc\d+)?(-labs)?))?", re.ASCII
 )
+# docker/dockerfile pinned by digest: the digest, not the tag, picks the image, so its version (and heredoc rules) is
+# unknown, but it is still docker/dockerfile.
+_DOCKERFILE_DIGEST_RE = re.compile(
+    r"(?:docker\.io/)?docker/dockerfile(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?@sha256:[0-9a-f]{64}", re.ASCII
+)
 
 # Heredocs, as BuildKit reads them: see _heredocs.
 # Go's unicode.IsSpace. Unlike str.isspace, it doesn't count \x1c-\x1f.
@@ -1195,12 +1200,22 @@ def _dockerfile_requirements(
     lines = [line.rstrip("\r") for line in text.split("\n")]
     if _escape_char(lines) != "\\":
         raise DockerfileError("--dockerfile-inputs only reads Dockerfiles with the default \\ escape")
-    if _heredoc_rules(syntax := _syntax_directive(lines)) is None:
+    syntax = _syntax_directive(lines)
+    # A digest-pinned docker/dockerfile reads FROM, WORKDIR, COPY and RUN as any version does; a heredoc under it is
+    # refused by _parse_froms, as plain --dockerfile refuses it.
+    if _heredoc_rules(syntax) is None and not (syntax and _DOCKERFILE_DIGEST_RE.fullmatch(syntax)):
         raise DockerfileError(
             f"# syntax={syntax}: --dockerfile-inputs only reads Dockerfiles for docker/dockerfile frontends"
         )
     instructions: list[tuple[int, str]] = []
     froms, _ = _parse_froms(text, instructions=instructions)
+    if _heredoc_rules(syntax) is None:  # a digest-pinned docker/dockerfile: any version, so any `<<` may be a heredoc
+        for number, instruction in instructions:
+            if _heredoc_args(instruction, "\\") is not None:
+                raise DockerfileError(
+                    f"line {number}: # syntax={syntax} may read the heredocs in {instruction.strip()[:60]!r} "
+                    "differently from docker/dockerfile 1.16 and later, which wheelgap follows"
+                )
     if not froms:
         raise DockerfileError("no FROM line found")
     final_line = froms[-1][0]
