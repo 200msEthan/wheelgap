@@ -463,7 +463,11 @@ def _uv_build_restrictions(path: Path, source: Source) -> None:
         if not config_path.is_file():
             return
     try:
-        data = tomllib.loads(config_path.read_text(encoding="utf-8"))
+        text = config_path.read_text(encoding="utf-8-sig")  # -sig: Windows editors add a BOM
+    except UnicodeDecodeError:
+        raise SourceError(f"{config_path}: isn't UTF-8, so its uv build restrictions can't be read") from None
+    try:
+        data = tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
         raise SourceError(f"{config_path}: invalid TOML: {exc}") from None
     setting_table = "uv.toml" if standalone else "[tool.uv]"
@@ -639,7 +643,15 @@ def select_uv_dependencies(
             continue
         pyproject = source.uv_pyproject
         if pyproject is not None and pyproject.is_file():
-            uv = tomllib.loads(pyproject.read_text(encoding="utf-8")).get("tool", {}).get("uv", {})
+            # Nothing else may have read this file yet: a uv.toml beside it replaces [tool.uv] for build restrictions.
+            try:
+                text = pyproject.read_text(encoding="utf-8-sig")  # -sig: Windows editors add a BOM
+            except UnicodeDecodeError:
+                raise SourceError(f"{pyproject}: isn't UTF-8, so its [tool.uv] default-groups can't be read") from None
+            try:
+                uv = tomllib.loads(text).get("tool", {}).get("uv", {})
+            except tomllib.TOMLDecodeError as exc:
+                raise SourceError(f"{pyproject}: invalid TOML: {exc}") from None
             defaults = uv.get("default-groups", ["dev"])
             if defaults == "all":
                 source.uv_default_groups = ["*"]

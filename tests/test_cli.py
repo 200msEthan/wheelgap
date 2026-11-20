@@ -4002,6 +4002,94 @@ def test_uv_build_policy_changes_cli_status_and_explanation(
     assert fake_pypi == []
 
 
+BAD_UTF8_LOCK = (
+    'version = 1\n[manifest]\nrequirements = [{ name = "fastlib" }]\n'
+    '[[package]]\nname = "fastlib"\nversion = "2.0.0"\n'
+    'source = { registry = "https://pypi.org/simple" }\n'
+    'wheels = [{ url = "https://files.example/fastlib-2.0.0-cp313-cp313-manylinux_2_17_x86_64.whl" }]\n'
+)
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_pyproject_beside_the_lock_that_isnt_utf8_is_an_input_error(capsys, fake_pypi, tmp_path, as_json):
+    (tmp_path / "uv.lock").write_text(BAD_UTF8_LOCK, encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_bytes("[tool.wheelgap]\n# café\n".encode("latin-1"))
+    args = [str(tmp_path), "-p", "3.13", "-t", "linux-x86_64"]
+    if as_json:
+        args.append("--json")
+    code, out, err = run(capsys, *args)
+    assert code == 2
+    assert "pyproject.toml" in err
+    assert "isn't UTF-8" in err
+    assert "Traceback" not in err
+    assert fake_pypi == []
+    if as_json:
+        error = json.loads(out)["error"]
+        assert error["type"] == "SourceError"
+        assert "pyproject.toml" in error["message"] and "isn't UTF-8" in error["message"]
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_uv_toml_beside_the_lock_that_isnt_utf8_is_an_input_error(capsys, fake_pypi, tmp_path, as_json):
+    (tmp_path / "uv.lock").write_text(BAD_UTF8_LOCK, encoding="utf-8")
+    (tmp_path / "uv.toml").write_bytes("no-build = true\n# café\n".encode("latin-1"))
+    args = [str(tmp_path), "-p", "3.13", "-t", "linux-x86_64"]
+    if as_json:
+        args.append("--json")
+    code, out, err = run(capsys, *args)
+    assert code == 2
+    assert "uv.toml" in err
+    assert "isn't UTF-8" in err
+    assert "Traceback" not in err
+    assert fake_pypi == []
+    if as_json:
+        error = json.loads(out)["error"]
+        assert error["type"] == "SourceError"
+        assert "uv.toml" in error["message"] and "isn't UTF-8" in error["message"]
+
+
+def test_a_pyproject_with_a_bom_is_read(tmp_path, capsys, fake_pypi):
+    (tmp_path / "uv.lock").write_text(
+        'version = 1\n[manifest]\nrequirements = [{ name = "fastlib" }, { name = "puresdist" }]\n'
+        '[[package]]\nname = "fastlib"\nversion = "2.0.0"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+        'wheels = [{ url = "https://files.example/fastlib-2.0.0-cp313-cp313-manylinux_2_17_x86_64.whl" }]\n'
+        'sdist = { url = "https://files.example/fastlib-2.0.0.tar.gz" }\n'
+        '[[package]]\nname = "puresdist"\nversion = "1.0"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+        'sdist = { url = "https://files.example/puresdist-1.0.tar.gz" }\n',
+        encoding="utf-8",
+    )
+    # No -p or -t: the Python comes from [tool.wheelgap] and the targets from [tool.uv] required-environments,
+    # so all three readers of this pyproject.toml have to get past the BOM.
+    (tmp_path / "pyproject.toml").write_bytes(
+        (
+            "\ufeff[tool.uv]\nno-build = true\nrequired-environments = [\"sys_platform == 'win32'\"]\n\n"
+            '[tool.wheelgap]\npython = ["3.13"]\n'
+        ).encode("utf-8")
+    )
+    code, out, err = run(capsys, str(tmp_path), "--json")
+    assert code == 1
+    data = json.loads(out)
+    # the [tool.wheelgap] python key and the required-environments targets apply despite the BOM
+    assert [(t["python"], t["platform"]) for t in data["targets"]] == [("3.13", "win-amd64"), ("3.13", "win-arm64")]
+    # and so does the [tool.uv] no-build policy: sdist-only puresdist is missing, not buildable from source
+    packages = {item["name"]: item for item in data["packages"]}
+    assert packages["puresdist"]["results"] == {"win-amd64": "missing", "win-arm64": "missing"}
+    assert fake_pypi == []
+
+
+def test_a_pyproject_with_a_bom_sets_uv_default_groups(capsys, fake_pypi, fixtures, tmp_path):
+    shutil.copy(fixtures / "uvselect" / "uv.lock", tmp_path)
+    (tmp_path / "pyproject.toml").write_bytes('\ufeff[tool.uv]\ndefault-groups = ["docs"]\n'.encode("utf-8"))
+    # --extra makes wheelgap read [tool.uv] default-groups, which replaces the dev group with docs
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--json", "--extra", "gpu")
+    assert code in (0, 1), err
+    names = {row["name"] for row in json.loads(out)["packages"]}
+    assert {"docstool", "gpu"} <= names
+    assert "devtool" not in names
+
+
 def test_explain_issues_url_text_output(capsys, fake_pypi):
     code, out, _ = run(capsys, "gapwithissues==1.0", "-p", "3.13", "-t", "linux-x86_64", "--explain")
     assert code == 1
