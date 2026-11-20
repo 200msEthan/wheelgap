@@ -86,6 +86,7 @@ nav:
       - PDM: case-studies/pdm.md
       - Streamlit: case-studies/streamlit.md
       - Litestar: case-studies/litestar.md
+      - FastMCP: case-studies/fastmcp.md
       - pydantic: case-studies/pydantic.md
       - HERD: case-studies/herd.md
   - Integrations:
