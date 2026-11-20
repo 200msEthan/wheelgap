@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A `uv.lock` (or a script's `.py.lock`) checked with `--online` is answered the way `uv sync` installs it, as it already was without `--online`. uv ignores `Requires-Python` upper bounds, so a pin whose files say `<3.15` no longer turns `missing` on Python 3.15 once the index is asked. Where pip would refuse such a file, a note on stderr gives the number of packages, `--explain` names them, and `--json` lists the files under a new `pip_refuses` key (`Result.pip_refuses` in the Python API). Requirements files still follow pip, and a file left out by `==3.14.*`, `~=` or `!=` stays left out. (#581, thanks [@kunalkshah1](https://github.com/kunalkshah1))
 - `wheelgap DIR` on a folder with no lockfile and a `pyproject.toml` that has `[dependency-groups]` but no `[project]` table now says how to check a group (`wheelgap DIR/pyproject.toml --group NAME`) and lists the groups. A setuptools, flit, PDM-legacy or Poetry project, where `--group` is refused because the project's own dependencies are outside `[project]`, gets no such hint. (#576, thanks [@HiZhenyu](https://github.com/HiZhenyu))
 - The weekly accuracy benchmark checks wheelgap's PyPI wheel predictions against uv as well as pip, with a separate report for each installer (#579, thanks [@kunalkshah1](https://github.com/kunalkshah1)).
 - Text and Markdown reports suggest `--fix` when a gap may be filled by a wheel on wheelgap's gap wheel index, without looking up the list. (#574, thanks [@kunalkshah1](https://github.com/kunalkshah1))
