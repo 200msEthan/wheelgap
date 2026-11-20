@@ -87,6 +87,7 @@ nav:
       - Streamlit: case-studies/streamlit.md
       - Litestar: case-studies/litestar.md
       - FastMCP: case-studies/fastmcp.md
+      - Pydantic AI: case-studies/pydantic-ai.md
       - pydantic: case-studies/pydantic.md
       - HERD: case-studies/herd.md
   - Integrations:

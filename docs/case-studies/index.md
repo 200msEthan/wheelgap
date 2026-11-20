@@ -16,3 +16,4 @@ These pages check real open-source projects on the platforms their build configu
 - [Streamlit: core dependencies versus integration tests](streamlit.md)
 - [Litestar: two documentation-only source builds on Python 3.14](litestar.md)
 - [FastMCP: optional and development pins on Python 3.15](fastmcp.md)
+- [Pydantic AI: a whole-lock audit with online metadata](pydantic-ai.md)
