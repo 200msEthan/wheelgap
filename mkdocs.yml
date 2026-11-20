@@ -84,6 +84,7 @@ nav:
       - Fava: case-studies/fava.md
       - Typer: case-studies/typer.md
       - PDM: case-studies/pdm.md
+      - Streamlit: case-studies/streamlit.md
       - pydantic: case-studies/pydantic.md
       - HERD: case-studies/herd.md
   - Integrations:

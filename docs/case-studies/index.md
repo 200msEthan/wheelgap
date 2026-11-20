@@ -13,3 +13,4 @@ These pages check real open-source projects on the platforms their build configu
 - [Fava: Beancount’s Python 3.15 wheel gap](fava.md)
 - [Typer: CPython 3.15 and 3.15t test dependencies across three platforms](typer.md)
 - [PDM: default dependencies versus documentation and optional groups](pdm.md)
+- [Streamlit: core dependencies versus integration tests](streamlit.md)
