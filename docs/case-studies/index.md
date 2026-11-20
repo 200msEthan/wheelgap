@@ -11,3 +11,4 @@ These pages check real open-source projects on the platforms their build configu
 - [Textual: syntax-highlighting wheels on Python 3.14](textual.md)
 - [Poetry: test groups versus main on Python 3.15](poetry.md)
 - [Fava: Beancount’s Python 3.15 wheel gap](fava.md)
+- [Typer: CPython 3.15 and 3.15t test dependencies across three platforms](typer.md)

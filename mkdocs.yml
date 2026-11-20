@@ -82,6 +82,7 @@ nav:
       - Textual: case-studies/textual.md
       - Poetry: case-studies/poetry.md
       - Fava: case-studies/fava.md
+      - Typer: case-studies/typer.md
       - pydantic: case-studies/pydantic.md
       - HERD: case-studies/herd.md
   - Integrations:
