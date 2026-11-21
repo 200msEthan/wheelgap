@@ -25,6 +25,7 @@ from .sources import (
     _join_continued_lines,
     _line_include,
     parse_requirements,
+    requirement_to_package,
 )
 from .targets import ALPINE_MUSL, DEBIAN_GLIBC
 
@@ -1165,6 +1166,46 @@ def _copies_config(copy: _Copy, names: tuple[str, ...]) -> bool:
     return names == _PIP_CONFIG_NAMES and (copy.dest + "/").startswith(_PIP_CONFIG)
 
 
+# Folders of the base image's own file tree, whose contents a Dockerfile doesn't show.
+_IMAGE_FOLDERS = frozenset(
+    "bin boot dev etc home lib lib32 lib64 libx32 media mnt opt proc root run sbin srv sys tmp usr var".split()
+)
+
+
+# What `/` of an official python image holds (Debian's and Alpine's root folders, with every arch's lib folders):
+# the names an unquoted glob run there can match. A superset only makes more globs stop.
+_OFFICIAL_ROOT = (
+    "bin boot dev etc home lib lib32 lib64 libx32 media mnt opt proc root run sbin srv sys tmp usr var .dockerenv"
+).split()
+
+
+def _names_in_folder(copies: list[_Copy], dirs: set[str], folder: str) -> list[tuple[str, int | None]]:
+    """(name, the COPY line or None for a WORKDIR) of every entry the instructions so far may put directly in
+    `folder` of the image: what each COPY from the build context brings there (a folder's entries listed on disk,
+    whatever the ignore rules leave out), and the folders WORKDIR and COPY made below it."""
+    names: list[tuple[str, int | None]] = []
+    for path in dirs:
+        if path.startswith(folder.rstrip("/") + "/"):
+            names.append((path[len(folder.rstrip("/")) + 1 :].split("/")[0], None))
+    for copy in copies:
+        if copy.error:
+            continue
+        names += [(binary, copy.line) for binary in copy.uv_binaries if copy.dest == folder]
+        for rel, host, is_dir in copy.sources:
+            landed = posixpath.join(copy.dest, posixpath.basename(rel)) if copy.into else copy.dest
+            if is_dir:
+                landed = copy.dest  # a folder's contents land in dest
+                inside = (
+                    posixpath.relpath(folder, landed) if (folder + "/").startswith(landed.rstrip("/") + "/") else None
+                )
+                if inside is not None and (host / inside).is_dir():
+                    names += [(entry, copy.line) for entry in os.listdir(host / inside)]
+                    continue
+            if landed.startswith(folder.rstrip("/") + "/"):
+                names.append((landed[len(folder.rstrip("/")) + 1 :].split("/")[0], copy.line))
+    return names
+
+
 def _requirement_includes(host: Path, number: int) -> list[tuple[bool, str]]:
     """The files a requirements or constraints file includes with -r or -c, as (whether it's a -c, the path as
     written), found on the same lines and with the same reader (`_line_include`) as `_read_requirements` in
@@ -1377,6 +1418,8 @@ _REDIRECTS = ("<<<", "<<-", "&>>", "<<", ">>", ">&", "<&", ">|", "<>", "&>", ">"
 class _Word:
     text: str  # as the shell would pass it, where `exact`; else as written, for messages and for name checks
     exact: bool = True  # False: an expansion wheelgap can't resolve, a glob, a tilde or a brace list is in it
+    brackets: bool = False  # not exact only for an unquoted [...], as in `pip install uvicorn[standard]`
+    variables: tuple[str, ...] = ()  # the variables whose known value is in `text`
     assigns: str | None = None  # NAME, for a word that starts with an unquoted NAME=
 
 
@@ -1408,6 +1451,7 @@ class _Shell:
         self.forgotten = False  # an eval or a sourced file may have set any variable
         self.parens = False  # a function definition is on the line
         self.depth = 0  # of ( ) subshells
+        self.used: list[str] = []  # the variables expanded in the word being read
 
     def parse(self, nested: bool = False) -> list[_Command]:
         text = self.text
@@ -1505,7 +1549,9 @@ class _Shell:
         text = self.text
         parts: list[str] = []
         exact = True
+        brackets = False
         start = self.pos
+        self.used = []
         while self.pos < len(text):
             ch = text[self.pos]
             if ch in " \t\n;|&()<>":
@@ -1548,16 +1594,13 @@ class _Shell:
                 exact = exact and known
             else:
                 # A glob, a tilde or (in bash) a brace list is expanded by the shell: the word isn't what is written.
-                if (
-                    ch in "*?"
-                    or (ch == "[" and re.compile(r"\[[^\s\]]+\]").match(text, self.pos))
-                    or (ch == "~" and self.pos == start)
-                    or (ch == "{" and self._brace_list())
-                ):
+                if ch == "[" and re.compile(r"\[[^\s\]]+\]").match(text, self.pos):
+                    brackets = True
+                elif ch in "*?" or (ch == "~" and self.pos == start) or (ch == "{" and self._brace_list()):
                     exact = False
                 parts.append(ch)
                 self.pos += 1
-        return _Word("".join(parts), exact)
+        return _Word("".join(parts), exact and not brackets, exact and brackets, tuple(self.used))
 
     def _brace_list(self) -> bool:
         m = re.compile(r"\{[^\s{}]*(?:,|\.\.)[^\s{}]*\}").match(self.text, self.pos)
@@ -1621,6 +1664,7 @@ class _Shell:
                 value = self.env[name]
                 # ${NAME}, and ${NAME:-word} / ${NAME-word} when NAME is set and not empty: NAME's value.
                 if value and (not rest or rest.startswith((":-", "-"))) and (quoted or _SAFE_VALUE_RE.fullmatch(value)):
+                    self.used.append(name)
                     return value, True
             return text[start : self.pos], False
         m = _SHELL_NAME_RE.match(text, self.pos)
@@ -1634,12 +1678,15 @@ class _Shell:
         if name in self.env and not self.forgotten:
             value = self.env[name]
             if quoted or _SAFE_VALUE_RE.fullmatch(value):
+                self.used.append(name)
                 return value, True
         return text[start : self.pos], False
 
     def _substitution(self, inner: str) -> None:
+        used = self.used
         sub = _Shell(inner, self.env, self.bash)
         self.commands.extend(sub.parse(nested=True))
+        self.used = used
 
 
 # What a command that isn't a pip or uv install is taken to be, by its name. None of these installs Python packages
@@ -1685,9 +1732,10 @@ _SYSTEM_PYTHON_TOOLS = frozenset(
     "dev devel pip venv virtualenv setuptools wheel distutils minimal full tk dbg doc libs apt pkg-resources "
     "is-python3 software-properties".split()
 )
-# A `pip install` of only these, with no -r FILE, sets up the installer itself: passed over, with a note that says
-# they aren't checked and that the pip the later lines run isn't known.
-_INSTALLER_TOOLS = frozenset("pip setuptools wheel uv poetry pipenv pdm virtualenv".split())
+# A `pip install` of only these, with no -r FILE, sets up pip itself: passed over, with a note that says they aren't
+# checked and that the pip the later lines run isn't known. (Each has only ever shipped a py3-none-any wheel; any
+# other tool a line installs, uv or poetry say, is a requirement like the rest.)
+_INSTALLER_TOOLS = frozenset("pip setuptools wheel".split())
 _BIN_DIRS = frozenset({"/bin", "/usr/bin", "/sbin", "/usr/sbin", "/usr/local/bin", "/usr/local/sbin"})
 PASSED_OVER = {
     "system-packages": "system package and account commands",
@@ -1819,6 +1867,8 @@ class InputsReport:
     # it doesn't know. The answer doesn't cover them, and the caller must say so where it can't be missed.
     warnings: list[tuple[int, str]] = field(default_factory=list)
     notes: list[tuple[int, str, str]] = field(default_factory=list)  # (line, kind, message)
+    # (line, the requirements a `pip install NAME...` on it names, whether uv installs them), in order.
+    named: list[tuple[int, list[str], bool]] = field(default_factory=list)
     # (line, what the line does) for every warning, in the order the lines run: an install after one is an error.
     unseen: list[tuple[int, str]] = field(default_factory=list)
     # (line, name) for each Python package a system package command installs (apk add py3-yaml, apt-get install
@@ -1844,11 +1894,14 @@ class _Install:
     files: list[str]
     constraints: list[str]
     prefer_binary: bool
+    names: list[str]  # requirements written on the command line: `pip install NAME==VERSION`
     cwd: str | None  # the folder a relative FILE is in, or None with cwd_error
     cwd_error: str | None
     seen: int = 0  # how many of the reader's mentions come before it
     unseen: int = 0  # how many lines wheelgap can't see into come before it (InputsReport.unseen)
     mounts: tuple[str, ...] = ()  # the folders a cache or tmpfs mount covers while it runs
+    globs: tuple[str, ...] = ()  # unquoted `name[extra]` words, which the shell expands if a file in cwd matches
+    created: int = 0  # how many of the reader's `created` come before it
 
 
 def _requirement_name(text: str) -> str | None:
@@ -1881,6 +1934,8 @@ class _RunReader:
         # (line, word, folder) for each word of a command that wasn't read and may name a file it writes.
         self.mentions: list[tuple[int, str, str | None]] = []  # with the folder the command ran in, if known
         self.config_error: str | None = None  # a command that may have written a pip or uv config file
+        # (line, word, folder) for each word of a mkdir, touch, ln or install that wasn't read: names it may create.
+        self.created: list[tuple[int, str, str | None]] = []
 
     def read(
         self,
@@ -1891,11 +1946,13 @@ class _RunReader:
         workdir: str | None,
         workdir_error: str | None,
         uv_system: bool,
+        arg_values: Mapping[str, bool] | None = None,
         bash: bool = False,
         body: str = "",
     ) -> list[_Install]:
-        """The installs of one RUN, in order. `bash` says the SHELL is bash, and `body` is the text of the RUN's
-        heredocs."""
+        """The installs of one RUN, in order. `arg_values` names the variables in `env` that are ARGs, with whether
+        --build-arg gave the value: an install that uses one gets a note, since another build may set another.
+        `bash` says the SHELL is bash, and `body` is the text of the RUN's heredocs."""
 
         def stop(message: str) -> NoReturn:
             raise DockerfileError(f"line {number}: {message}")
@@ -2061,7 +2118,16 @@ class _RunReader:
                 if any(operator.endswith("<") for operator, _ in command.redirects):
                     stop(f"`{' '.join(texts)}` reads its input from a redirect, which --dockerfile-inputs doesn't read")
                 detail.cwd, detail.cwd_error, detail.seen = cwd, cwd_error, len(self.mentions)
+                for name in dict.fromkeys(name for word in command.words for name in word.variables):
+                    if name in (arg_values or {}) and name in env:
+                        how = (
+                            f"--build-arg {name}={env[name]}"
+                            if (arg_values or {})[name]
+                            else f"the default of ARG {name}={env[name]}; pass --build-arg if the build sets one"
+                        )
+                        self.report.notes.append((number, "arg-value", f"this install uses {how}"))
                 detail.unseen, detail.mounts = len(self.report.unseen), tuple(covered)
+                detail.created = len(self.created)
                 if unknown_mount:
                     stop(f"{unknown_mount}, and it may hide the requirements file or put a pip config file in place")
                 if config := next((folder for folder in covered if _config_folder(folder)), None):
@@ -2103,6 +2169,8 @@ class _RunReader:
                     written.append(folder if folder.startswith("/") or cwd is not None else "/")
                     anywhere = folder == "/"  # git: any file of the work tree, which the config check leaves out
             self.mentions += [(number, text, cwd) for text in written]
+            if first in ("mkdir", "touch", "ln", "install"):
+                self.created += [(number, word.text, cwd) for word in words[1:] if not word.text.startswith("-")]
             sources_only = (
                 [word.text for word in words[1:-1]] if first in ("cp", "mv", "ln", "install", "rsync") else []
             )
@@ -2433,6 +2501,20 @@ class _RunReader:
             return "pip", ""  # nothing is installed, and nothing is read
         if subcommand != "install":
             stop(f"`{shown}`: only `install` is read of {tool}'s commands, and this one may change what is installed")
+        # An unquoted name[extra] is a glob to the shell, which leaves it as written unless a file of that very
+        # shape (the name plus one letter of the extras) is in the folder: read as the requirement it spells, once
+        # read_install has checked that the folder holds no such file (_Install.globs).
+        for i, word in enumerate(args):
+            if word.brackets and _requirement_name(word.text) is None and ("/" in word.text or word.text[:1] == "."):
+                if word.text.startswith(("-e", "--editable")) or (i and args[i - 1].text in ("-e", "--editable")):
+                    stop(
+                        f"{tool} install -e {word.text.removeprefix('--editable=').removeprefix('-e')}: an editable "
+                        "install of a project folder isn't read by --dockerfile-inputs yet: only requirements files "
+                        "and requirements by name are"
+                    )
+                _command_line_requirement(number, tool, word.text)  # a project folder or a file: says so
+        globs = tuple(word.text for word in args if word.brackets and _requirement_name(word.text) is not None)
+        args = [_Word(word.text) if word.text in globs else word for word in args]
         if unknown := next((word for word in args if not word.exact), None):
             if both := next((name for name in self.ambiguous if re.search(rf"\$\{{?{name}\b", unknown.text)), None):
                 stop(
@@ -2453,8 +2535,8 @@ class _RunReader:
                 # A pip other than the newest may pick other files (older pips don't know newer manylinux tags).
                 return "warning", f"`{shown}`, which installs a pip version wheelgap doesn't answer for"
             return "installer-tools", " ".join(dict.fromkeys(tools))
-        files, constraints, prefer_binary = _pip_install_files(number, rest, uv, uv_system)
-        return "install", _Install(uv, files, constraints, prefer_binary, None, None)
+        files, constraints, prefer_binary, names = _pip_install_files(number, rest, uv, uv_system)
+        return "install", _Install(uv, files, constraints, prefer_binary, names, None, None, globs=globs)
 
 
 def _env_pairs(
@@ -2530,10 +2612,74 @@ def _names_config(text: str) -> bool:
     return any(word in text for word in _CONFIG_WORDS)
 
 
-def _pip_install_files(number: int, rest: list[str], uv: bool, uv_system: bool) -> tuple[list[str], list[str], bool]:
-    """(the -r FILEs, the -c FILEs, whether --prefer-binary is given) of the words of a `pip install ...` or
-    `uv pip install ...` command, from `install` on, with flags that don't change what the installer picks.
-    `uv_system` says UV_SYSTEM_PYTHON is set, which uv reads as --system."""
+_ARCHIVE_SUFFIXES = (
+    ".whl",
+    ".zip",
+    ".tar.gz",
+    ".tgz",
+    ".tar",
+    ".tar.bz2",
+    ".tbz",
+    ".tar.xz",
+    ".txz",
+    ".tlz",
+    ".tar.lz",
+)
+_PIP_INDEX_FLAGS = ("-i", "-f", "--index-url", "--extra-index-url", "--find-links", "--no-index", "--trusted-host")
+_UV_INDEX_FLAGS = (*_PIP_INDEX_FLAGS, "--index", "--default-index", "--index-strategy")
+
+
+def _command_line_requirement(number: int, tool: str, text: str) -> str:
+    """A word of `pip install` that isn't an option or an option's value, as the requirement it is, or a
+    DockerfileError saying what else it is. pip reads a word as a path when it has a path separator or starts
+    with a dot, and as a file when it ends like an archive (`_looks_like_path` and `_get_url_from_path` in pip
+    26.2's req/constructors.py); a bare name is a requirement even when a folder of that name exists."""
+    if text.startswith("-"):
+        flags = _UV_FLAGS_READ if tool == "uv pip" else _PIP_FLAGS_READ
+        for_uv = " for uv" if tool == "uv pip" else ""
+        raise DockerfileError(f"line {number}: {tool} install {text}: --dockerfile-inputs only reads {flags}{for_uv}")
+    local = "/" in text or "\\" in text or text.startswith(".") or text.lower().endswith(_ARCHIVE_SUFFIXES)
+    if local and "://" not in text:
+        raise DockerfileError(
+            f"line {number}: {tool} install {text}: a project folder or a file is installed here, which "
+            "--dockerfile-inputs doesn't read yet: only requirements files and requirements by name are"
+        )
+    try:
+        requirement = Requirement(text)
+    except InvalidRequirement:
+        requirement = None
+    if requirement is None or requirement.url or "://" in text:
+        raise DockerfileError(
+            f"line {number}: {tool} install: a URL or something that isn't a requirement is installed here, which "
+            "--dockerfile-inputs doesn't read (the text is left out, since a URL may hold credentials)"
+        )
+    return text
+
+
+def _pip_install_files(
+    number: int, rest: list[str], uv: bool, uv_system: bool
+) -> tuple[list[str], list[str], bool, list[str]]:
+    """(the -r FILEs, the -c FILEs, whether --prefer-binary is given, the requirements named on the line) of the
+    words of a `pip install ...` or `uv pip install ...` command, from `install` on, with flags that don't change
+    what the installer picks. `uv_system` says UV_SYSTEM_PYTHON is set, which uv reads as --system."""
+    tool = "uv pip" if uv else "pip"
+    for word in rest[1:]:
+        option = word.split("=", 1)[0]
+        if option in (_UV_INDEX_FLAGS if uv else _PIP_INDEX_FLAGS) or (
+            word[:2] in ("-i", "-f") and not word.startswith("--") and word not in ("-i", "-f")
+        ):
+            # Requirements files have the same gap (an index line in one is not followed), and it isn't copied here.
+            raise DockerfileError(
+                f"line {number}: {tool} install {option if option.startswith('--') else word[:2]}: this line "
+                "installs from another index or a folder of files, where the files can differ from PyPI's, and "
+                "--dockerfile-inputs only checks PyPI"
+            )
+        if option in ("-e", "--editable"):
+            raise DockerfileError(
+                f"line {number}: {tool} install {option}: an editable install of a project folder isn't read by "
+                "--dockerfile-inputs yet: only requirements files and requirements by name are"
+            )
+    names: list[str] = []
     files: list[str] = []
     constraints: list[str] = []
     prefer_binary = False
@@ -2556,9 +2702,8 @@ def _pip_install_files(number: int, rest: list[str], uv: bool, uv_system: bool) 
             elif rest[i] in _UV_HARMLESS_FLAGS:
                 i += 1
             else:
-                raise DockerfileError(
-                    f"line {number}: uv pip install {rest[i]}: --dockerfile-inputs only reads {_UV_FLAGS_READ} for uv"
-                )
+                names.append(_command_line_requirement(number, tool, rest[i]))
+                i += 1
         elif rest[i] in ("-r", "--requirement") and i + 1 < len(rest) and not rest[i + 1].startswith("-"):
             files.append(rest[i + 1])
             i += 2
@@ -2575,12 +2720,14 @@ def _pip_install_files(number: int, rest: list[str], uv: bool, uv_system: bool) 
             prefer_binary = True
             i += 1
         else:
-            raise DockerfileError(
-                f"line {number}: pip install {rest[i]}: --dockerfile-inputs only reads {_PIP_FLAGS_READ}"
-            )
-    if not files:
+            names.append(_command_line_requirement(number, tool, rest[i]))
+            i += 1
+    if not files and not names:
+        raise DockerfileError(f"line {number}: {tool} install names nothing to install")
+    if names and constraints:
         raise DockerfileError(
-            f"line {number}: {'uv pip' if uv else 'pip'} install with no -r FILE isn't read by --dockerfile-inputs"
+            f"line {number}: {tool} install -c FILE with requirements on the command line isn't read by "
+            "--dockerfile-inputs yet: put them in a requirements file"
         )
     if uv and not system:
         raise DockerfileError(
@@ -2597,7 +2744,7 @@ def _pip_install_files(number: int, rest: list[str], uv: bool, uv_system: bool) 
                     f"line {number}: uv pip install {option} {other}: uv reads a file by its name (a lock, a script, "
                     "a project), and --dockerfile-inputs only reads requirements files named *.txt or *.in for uv"
                 )
-    return files, constraints, prefer_binary
+    return files, constraints, prefer_binary, names
 
 
 def dockerfile_requirements(
@@ -2792,9 +2939,56 @@ def _dockerfile_requirements(
             includes[number, host] = nested
         return host
 
+    def check_glob(glob: str, install: _Install) -> None:
+        """An unquoted `name[extra]` is read as written only when the folder the install runs in can't hold a name
+        the glob matches (`sixa` for `six[a]`, which the shell would put in its place)."""
+        quote = f"quote it ('{glob}') so the shell leaves it as it is"
+        folder = install.cwd
+        why = None
+        if folder is None:
+            why = "the folder it runs in isn't known"
+        elif not image_read:
+            why = f"the image may have files in {folder}"
+        elif (folder != "/" or not official) and (folder == "/" or folder.split("/")[1] in _IMAGE_FOLDERS):
+            why = f"{folder} is a folder of the image, which may hold files"
+        if why is None and folder is not None:
+            for line, word, cwd in [*reader.mentions[: install.seen], *reader.created[: install.created]]:
+                if word.startswith("/") or cwd is not None:
+                    path = posixpath.normpath(posixpath.join(cwd or "/", word))
+                    if path == folder or folder.startswith(path.rstrip("/") + "/"):
+                        why = f"line {line} may put files in {folder}"
+                        break
+                    if posixpath.dirname(path) == folder and (
+                        fnmatch.fnmatchcase(posixpath.basename(path), glob) or re.search(r"[*?\[]", path)
+                    ):
+                        why = f"line {line} may put {posixpath.basename(path)} in {folder}"
+                        break
+                elif posixpath.basename(word) and fnmatch.fnmatchcase(posixpath.basename(word), glob):
+                    why = f"line {line} may create {word}"
+                    break
+        if why is None:
+            assert folder is not None
+            root = [(name, None) for name in _OFFICIAL_ROOT] if folder == "/" else []
+            for name, copy_line in [*root, *_names_in_folder(copies, dirs, folder)]:
+                if fnmatch.fnmatchcase(name, glob):
+                    by = (
+                        f"the COPY on line {copy_line}"
+                        if copy_line is not None
+                        else "the image"
+                        if name in _OFFICIAL_ROOT
+                        else "a WORKDIR"
+                    )
+                    raise DockerfileError(
+                        f"line {number}: {glob} is a glob to the shell, and {by} puts {name} in {folder}, "
+                        f"which it matches, so pip would install {name}: {quote}"
+                    )
+            return
+        raise DockerfileError(f"line {number}: {glob} is a glob to the shell, and {why}: {quote}")
+
     reader = _RunReader(report, pythons, image_read)
     env: dict[str, str] = {}  # the ENV and ARG values wheelgap knows, as the shell of a RUN sees them
     uv_system = False  # ENV UV_SYSTEM_PYTHON=1: uv reads it as --system
+    arg_values: dict[str, bool] = {}  # the names in env that an ARG set, and whether --build-arg gave the value
     bash = False  # SHELL ["/bin/bash", "-c"]: `&>` is a redirect, not `&`
     env_names: set[str] = set()  # the names an ENV set
     global_defaults = global_args.defaults if not global_args.unreadable else {}
@@ -2880,6 +3074,28 @@ def _dockerfile_requirements(
             installed_by_uv[host] = uv
             used_constraints[host] = constraint_paths
             found.setdefault(host, number)
+        for glob in install.globs:
+            check_glob(glob, install)
+        if install.names:
+            loose = [
+                name for name in install.names if requirement_to_package(name, "").version is None
+            ]  # with a marker or extras, a pin is still a pin
+            if uv and loose:
+                raise DockerfileError(
+                    f"line {number}: uv pip install: {loose[0]} isn't pinned with ==, and uv and pip can pick "
+                    "different versions for a range: pin it"
+                )
+            if install.prefer_binary and (dependencies or loose):
+                raise DockerfileError(
+                    f"line {number}: pip install --prefer-binary makes pip pick an older release that has a "
+                    "wheel, so it's only read when every requirement on the line is pinned with == "
+                    "and --deps isn't used"
+                )
+            # One entry per RUN line and installer: `pip install a && pip install b` names a and b on the line.
+            if report.named and report.named[-1][0] == number and report.named[-1][2] == uv:
+                report.named[-1][1].extend(install.names)
+            else:
+                report.named.append((number, list(install.names), uv))
         # An unread COPY or ADD before the one that copies FILE may still put a pip config file in the image.
         if unread := next((copy for copy in copies if copy.error), None):
             raise DockerfileError(f"line {unread.line}: {unread.error}")
@@ -2929,6 +3145,9 @@ def _dockerfile_requirements(
                     )
                 continue
             for name, value, unset in pairs:
+                arg_values.pop(name, None)
+                if keyword == "ARG" and value is not None:
+                    arg_values[name] = name in (build_args or {})
                 if unset:
                     # An ARG with no default and no --build-arg isn't in the RUN's environment (dispatchArg).
                     if _installer_setting(name):
@@ -2968,18 +3187,19 @@ def _dockerfile_requirements(
                     uv_system = value is not None and value.lower() in ("1", "true")
         elif keyword == "RUN":
             body = "\n".join(bodies.get(number, []))
-            for install in reader.read(number, instruction, args, env, workdir, workdir_error, uv_system, bash, body):
+            for install in reader.read(
+                number, instruction, args, env, workdir, workdir_error, uv_system, arg_values, bash, body
+            ):
                 read_install(install)
     # A system package installed after the last install can't be one pip keeps instead of fetching.
     del report.system_python[reader.system_before :]
-    if not found:
+    if not found and not report.named:
         unseen = ""
         if report.warnings:
             where = ", ".join(str(line) for line, _ in report.warnings)
             unseen = f" (it has commands wheelgap can't see into, which may install some: line {where})"
         raise DockerfileError(
-            f"the final stage (line {final_line}) has no `RUN pip install -r FILE` that --dockerfile-inputs can read"
-            + unseen
+            f"the final stage (line {final_line}) has no `RUN pip install` that --dockerfile-inputs can read" + unseen
         )
     if constraints is not None:
         constraints.update(used_constraints)
