@@ -1,9 +1,10 @@
 import json
+import os
 import re
 
 import pytest
 
-from wheelgap import pypi
+from wheelgap import dockerignore, pypi
 from wheelgap.cli import main
 from wheelgap.dockerfile import (
     DockerfileError,
@@ -1169,7 +1170,7 @@ def test_dockerfile_requirements_refuses(tmp_path, dockerfile, message):
         dockerfile_requirements(path)
 
 
-def test_dockerfile_requirements_refuses_a_dockerignore_and_nested_includes(tmp_path):
+def test_dockerfile_requirements_refuses_nested_includes(tmp_path):
     path = _context(tmp_path, "FROM python:3.13\nWORKDIR /app\nCOPY . .\nRUN pip install -r requirements.txt\n")
     # pip strips a byte order mark and reads abbreviated options, so these include base.txt too.
     # pip also reads one after other options on a line, and over a continuation.
@@ -1191,9 +1192,229 @@ def test_dockerfile_requirements_refuses_a_dockerignore_and_nested_includes(tmp_
             DockerfileError, match=":4: (?:/app/base.txt isn't copied|requirements.txt has an unreadable)"
         ):
             dockerfile_requirements(path)
-    (tmp_path / ".dockerignore").write_text("*.txt\n", encoding="utf-8")
-    with pytest.raises(DockerfileError, match=r"\.dockerignore may leave files out of the build context"):
+
+
+@pytest.mark.parametrize(
+    ("rules", "excluded_by"),
+    [
+        (".git\n__pycache__/\n", None),
+        ("deps\n!deps/requirements.txt\n", None),
+        ("deps/*\n!deps/requirements.txt\n", None),  # an ordinary exception below a folder is still one
+        ("*.txt\n", None),  # a lone * does not cross a path separator
+        ("**/requirement?.[t-v]xt\n", "**/requirement?.[t-v]xt"),
+        ("**/requirements*.txt\n", "**/requirements*.txt"),
+        ("/deps/\n", "/deps/"),
+        ("deps\n!deps/requirements.txt\n**/requirements.txt\n", "**/requirements.txt"),
+        ("**/requirements.txt\n!deps/requirements.txt\n", None),
+        ("deps\n!deps\ndeps/requirements.txt\n", "deps/requirements.txt"),
+        ("\ufeff# deps\r\n.\r\n", None),
+        ("  # deps\n", None),
+    ],
+)
+def test_dockerfile_requirements_dockerignore_matching(tmp_path, rules, excluded_by):
+    path = _context(tmp_path, "FROM python:3.13\nWORKDIR /app\nCOPY . .\nRUN pip install -r deps/requirements.txt\n")
+    requirements = tmp_path / "deps" / "requirements.txt"
+    requirements.parent.mkdir()
+    requirements.write_text("purewheel==3.1\n", encoding="utf-8")
+    (tmp_path / ".dockerignore").write_bytes(rules.encode())
+    if excluded_by:
+        with pytest.raises(
+            DockerfileError, match=r":3: COPY .: deps/requirements.txt is excluded .* \.dockerignore"
+        ) as err:
+            dockerfile_requirements(path)
+        assert repr(excluded_by) in str(err.value)
+    else:
+        assert dockerfile_requirements(path) == [(4, requirements)]
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        b"[unclosed",
+        b"!",
+        b"!/",
+        b"[z-a]",
+        b"\xff",
+        # Moby's matcher cleans and trims a pattern a second time, so it reads these two as the exceptions
+        # `!requirements.txt` and `!keep`, and trims the space that cleaning leaves at an end of the next two.
+        b"./!requirements.txt",
+        b"/!keep",
+        b"./ requirements.txt",
+        b"!requirements.txt /",
+        # ...and cleans an exception with its ! on: this one becomes the rule `requirements.txt`, which excludes.
+        b"!../../requirements.txt",
+    ],
+)
+def test_dockerfile_requirements_refuses_unreadable_dockerignore(tmp_path, pattern):
+    path = _context(tmp_path, "FROM python:3.13\nWORKDIR /app\nCOPY . .\nRUN pip install -r requirements.txt\n")
+    (tmp_path / ".dockerignore").write_bytes(b"# comment\n" + pattern + b"\n")
+    with pytest.raises(DockerfileError, match=r"\.dockerignore:2:"):
         dockerfile_requirements(path)
+
+
+@pytest.mark.parametrize("pattern", ["a\\*b", "deps\\*.txt", "//deps", "c:deps", "!a\\*b"])
+def test_dockerignore_refuses_patterns_a_windows_client_reads_differently(tmp_path, monkeypatch, pattern):
+    ignore = tmp_path / ".dockerignore"
+    ignore.write_text(pattern + "\n", encoding="utf-8")
+    monkeypatch.setattr(dockerignore, "_WINDOWS_CLIENT", False)
+    assert dockerignore.read_rules(ignore)
+    monkeypatch.setattr(dockerignore, "_WINDOWS_CLIENT", True)
+    with pytest.raises(dockerignore.IgnoreError, match=r"\.dockerignore:1: unsupported or invalid"):
+        dockerignore.read_rules(ignore)
+
+
+# Moby's own tests of the matcher BuildKit uses (TestMatches and matchTests), without the rows whose path ends in /:
+# https://github.com/moby/patternmatcher/blob/5a6d8429a19bb6948a372ff19e86fe83599a04b7/patternmatcher_test.go
+# Each is (lines of the ignore file, path, whether the path is left out). A path is checked as BuildKit's walk
+# reaches it, through its parent folders, so `a*` leaves out ab/c.
+_MOBY_MATCHES = [
+    ("**", "file", True),
+    ("**/", "file", True),
+    ("**", "dir/file", True),
+    ("**/", "dir/file", True),
+    ("**/**", "dir/file", True),
+    ("dir/**", "dir/file", True),
+    ("dir/**", "dir/dir2/file", True),
+    ("**/dir", "dir", True),
+    ("**/dir", "dir/file", True),
+    ("**/dir2/*", "dir/dir2/file", True),
+    ("**/dir2/**", "dir/dir2/dir3/file", True),
+    ("**file", "file", True),
+    ("**file", "dir/file", True),
+    ("**/file", "dir/file", True),
+    ("**file", "dir/dir/file", True),
+    ("**/file", "dir/dir/file", True),
+    ("**/file*", "dir/dir/file", True),
+    ("**/file*", "dir/dir/file.txt", True),
+    ("**/file*txt", "dir/dir/file.txt", True),
+    ("**/file*.txt", "dir/dir/file.txt", True),
+    ("**/file*.txt*", "dir/dir/file.txt", True),
+    ("**/**/*.txt", "dir/dir/file.txt", True),
+    ("**/**/*.txt2", "dir/dir/file.txt", False),
+    ("**/*.txt", "file.txt", True),
+    ("**/**/*.txt", "file.txt", True),
+    ("a**/*.txt", "a/file.txt", True),
+    ("a**/*.txt", "a/dir/file.txt", True),
+    ("a**/*.txt", "a/dir/dir/file.txt", True),
+    ("a/*.txt", "a/dir/file.txt", False),
+    ("a/*.txt", "a/file.txt", True),
+    ("a/*.txt**", "a/file.txt", True),
+    ("a[b-d]e", "ae", False),
+    ("a[b-d]e", "ace", True),
+    ("a[b-d]e", "aae", False),
+    ("a[^b-d]e", "aze", True),
+    (".*", ".foo", True),
+    (".*", "foo", False),
+    ("abc.def", "abcdef", False),
+    ("abc.def", "abc.def", True),
+    ("abc.def", "abcZdef", False),
+    ("abc?def", "abcZdef", True),
+    ("abc?def", "abcdef", False),
+    ("**/foo/bar", "foo/bar", True),
+    ("**/foo/bar", "dir/foo/bar", True),
+    ("**/foo/bar", "dir/dir2/foo/bar", True),
+    ("abc/**", "abc", False),
+    ("abc/**", "abc/def", True),
+    ("abc/**", "abc/def/ghi", True),
+    ("**/.foo", ".foo", True),
+    ("**/.foo", "bar.foo", False),
+    ("a(b)c/def", "a(b)c/def", True),
+    ("a(b)c/def", "a(b)c/xyz", False),
+    ("a.|)$(}+{bc", "a.|)$(}+{bc", True),
+    (
+        "dist/proxy.py-2.4.0rc3.dev36+g08acad9-py3-none-any.whl",
+        "dist/proxy.py-2.4.0rc3.dev36+g08acad9-py3-none-any.whl",
+        True,
+    ),
+    ("dist/*.whl", "dist/proxy.py-2.4.0rc3.dev36+g08acad9-py3-none-any.whl", True),
+    ("**\n!util/docker/web", "util/docker/web/foo", False),
+    ("**\n!util/docker/web\nutil/docker/web/foo", "util/docker/web/foo", True),
+    (
+        "**\n!dist/proxy.py-2.4.0rc3.dev36+g08acad9-py3-none-any.whl",
+        "dist/proxy.py-2.4.0rc3.dev36+g08acad9-py3-none-any.whl",
+        False,
+    ),
+    ("**\n!dist/*.whl", "dist/proxy.py-2.4.0rc3.dev36+g08acad9-py3-none-any.whl", False),
+    ("abc", "abc", True),
+    ("*", "abc", True),
+    ("*c", "abc", True),
+    ("a*", "a", True),
+    ("a*", "abc", True),
+    ("a*", "ab/c", True),
+    ("a*/b", "abc/b", True),
+    ("a*/b", "a/c/b", False),
+    ("a*b*c*d*e*/f", "axbxcxdxe/f", True),
+    ("a*b*c*d*e*/f", "axbxcxdxexxx/f", True),
+    ("a*b*c*d*e*/f", "axbxcxdxe/xxx/f", False),
+    ("a*b*c*d*e*/f", "axbxcxdxexxx/fff", False),
+    ("a*b?c*x", "abxbbxdbxebxczzx", True),
+    ("a*b?c*x", "abxbbxdbxebxczzy", False),
+    ("ab[c]", "abc", True),
+    ("ab[b-d]", "abc", True),
+    ("ab[e-g]", "abc", False),
+    ("ab[^c]", "abc", False),
+    ("ab[^b-d]", "abc", False),
+    ("ab[^e-g]", "abc", True),
+    ("a?b", "a\u263ab", True),
+    ("a[^a]b", "a\u263ab", True),
+    ("a???b", "a\u263ab", False),
+    ("a[^a][^a][^a]b", "a\u263ab", False),
+    ("[a-\u03b6]*", "\u03b1", True),
+    ("*[a-\u03b6]", "A", False),
+    ("a?b", "a/b", False),
+    ("a*b", "a/b", False),
+    ("*x", "xxx", True),
+    # fsutil's walk (TestWalkerExclude, TestFSWalkNested, TestFilteredOpenInvert in filter_test.go): an exception
+    # under an excluded folder is kept, and what a later rule excludes again under it is not.
+    ("foo*\n!foo/bar2", "foo/bar2", False),
+    ("foo*\n!foo/bar2", "foo2", True),
+    ("foo\n!foo/bar", "foo/bar", False),
+    ("foo\n!foo/bar\nfoo/bar/baz\n!foo/bar/baz/x", "foo/bar/baz/x", False),
+    ("foo\n!foo/bar\nfoo/bar/baz\n!foo/bar/baz/x", "foo/bar/baz/y", True),
+    ("**/bar\n!foo/bar/baz", "foo/bar/x", True),
+]
+# A backslash escapes the next character, except on a Windows client (see _WINDOWS_CLIENT).
+_MOBY_ESCAPES = [
+    ("a\\\\", "a\\", True),
+    ("a\\*b", "a*b", True),
+    ("a\\*b", "ab", False),
+    ("[\\]a]", "]", True),
+    ("[\\-]", "-", True),
+    ("[x\\-]", "x", True),
+    ("[x\\-]", "-", True),
+    ("[x\\-]", "z", False),
+    ("[\\-x]", "x", True),
+    ("[\\-x]", "-", True),
+    ("[\\-x]", "a", False),
+]
+
+
+def _ignored(tmp_path, lines, path):
+    ignore = tmp_path / ".dockerignore"
+    ignore.write_bytes((lines + "\n").encode())
+    return dockerignore.ignored(path, dockerignore.read_rules(ignore)) is not None
+
+
+@pytest.mark.parametrize(("lines", "path", "expected"), _MOBY_MATCHES)
+def test_dockerignore_matches_as_moby_does(tmp_path, lines, path, expected):
+    assert _ignored(tmp_path, lines, path) is expected
+
+
+@pytest.mark.skipif(os.sep == "\\", reason="on Windows Docker reads a backslash as a path separator")
+@pytest.mark.parametrize(("lines", "path", "expected"), _MOBY_ESCAPES)
+def test_dockerignore_escapes_as_moby_does(tmp_path, lines, path, expected):
+    assert _ignored(tmp_path, lines, path) is expected
+
+
+# Patterns Moby's tests expect an error for: filepath.Match rejects them, or (the last) Go's regexp does.
+@pytest.mark.parametrize(
+    "pattern", ["[]a]", "[-]", "[x-]", "[-x]", "\\", "[a-b-c]", "[", "[^", "[^bc", "a[", "[Local-Only]/"]
+)
+def test_dockerignore_refuses_what_moby_rejects(tmp_path, pattern):
+    ignore = tmp_path / ".dockerignore"
+    ignore.write_text(pattern + "\n", encoding="utf-8")
+    with pytest.raises(dockerignore.IgnoreError, match=r"\.dockerignore:1: unsupported or invalid"):
+        dockerignore.read_rules(ignore)
 
 
 @pytest.mark.parametrize(
@@ -1629,6 +1850,147 @@ def test_dockerfile_requirements_install_constraints_and_in_file_constraints_sha
         dockerfile_requirements(path, constraints={})
 
 
+_COPY_ALL = "FROM python:3.13\nWORKDIR /app\nCOPY . .\n"
+
+
+@pytest.mark.parametrize(
+    ("dockerfile", "files", "rules", "error"),
+    [
+        # A file the installed file includes: the image has requirements.txt but not base.txt, so pip stops the build.
+        (
+            _COPY_ALL + "RUN pip install -r requirements.txt\n",
+            {"requirements.txt": "-r base.txt\n"},
+            "base.txt\n",
+            r":3: COPY \.: base\.txt is excluded from the build context by \.dockerignore:1 \('base\.txt'\)",
+        ),
+        # The same two levels down, and with -c: no file in the chain is read once one is left out.
+        (
+            _COPY_ALL + "RUN pip install -r requirements.txt\n",
+            {"requirements.txt": "-r more.txt\n", "more.txt": "-c base.txt\npurewheel\n"},
+            "# local pins\n**/base.txt\n",
+            r":3: COPY \.: base\.txt is excluded from the build context by \.dockerignore:2 \('\*\*/base\.txt'\)",
+        ),
+        # The -c file on the RUN line.
+        (
+            _COPY_ALL + "RUN pip install -r requirements.txt -c constraints.txt\n",
+            {"constraints.txt": "purewheel==3.1\n"},
+            "constraints.txt\n",
+            r":3: COPY \.: constraints\.txt is excluded from the build context by \.dockerignore:1 ",
+        ),
+        # A -r inside the -c file: pip installs what it names, so it must be in the image too.
+        (
+            _COPY_ALL + "RUN pip install -r requirements.txt -c constraints.txt\n",
+            {"constraints.txt": "-r base.txt\npurewheel==3.1\n"},
+            "base.txt\n",
+            r":3: COPY \.: base\.txt is excluded from the build context by \.dockerignore:1 \('base\.txt'\)",
+        ),
+        # --prefer-binary parses the files to look for pins, after the excluded one is refused.
+        (
+            _COPY_ALL + "RUN pip install --prefer-binary -r requirements.txt\n",
+            {"requirements.txt": "-r base.txt\npurewheel==3.1\n", "base.txt": "nowheels==0.9\n"},
+            "base.txt\n",
+            r":3: COPY \.: base\.txt is excluded from the build context by \.dockerignore:1 \('base\.txt'\)",
+        ),
+        # A source COPY names that the rules leave out is "not found" to BuildKit, and the build fails on that line,
+        # whether or not anything reads the file.
+        (
+            "FROM python:3.13\nWORKDIR /app\nCOPY requirements.txt base.txt ./\nRUN pip install -r requirements.txt\n",
+            {"requirements.txt": "-r base.txt\n"},
+            "base.txt\n",
+            r":3: COPY base\.txt: excluded from the build context by \.dockerignore:1 \('base\.txt'\)",
+        ),
+        (
+            "FROM python:3.13\nWORKDIR /app\nCOPY requirements.txt base.txt ./\nRUN pip install -r requirements.txt\n",
+            {},
+            "base.txt\n",
+            r":3: COPY base\.txt: excluded from the build context by \.dockerignore:1 \('base\.txt'\)",
+        ),
+    ],
+)
+def test_dockerfile_requirements_refuses_includes_the_ignore_rules_leave_out(tmp_path, dockerfile, files, rules, error):
+    path = _context(tmp_path, dockerfile, ["requirements.txt", "base.txt"])
+    for name, text in files.items():
+        (tmp_path / name).write_text(text, encoding="utf-8")
+    # Without the ignore file every one of these is read: the files are all in the folder.
+    assert dockerfile_requirements(path, constraints={}, includes={}) == [(4, tmp_path / "requirements.txt")]
+    (tmp_path / ".dockerignore").write_bytes(rules.encode())
+    with pytest.raises(DockerfileError, match=error):
+        dockerfile_requirements(path, constraints={}, includes={})
+
+
+def test_dockerfile_requirements_follows_an_include_a_later_rule_puts_back(tmp_path):
+    path = _context(tmp_path, _COPY_ALL + "RUN pip install -r requirements.txt\n", ["requirements.txt", "base.txt"])
+    requirements, base = tmp_path / "requirements.txt", tmp_path / "base.txt"
+    requirements.write_text("-r base.txt\n", encoding="utf-8")
+    (tmp_path / ".dockerignore").write_bytes(b"*.txt\n!requirements.txt\n")
+    with pytest.raises(DockerfileError, match=r":3: COPY \.: base\.txt is excluded .* \.dockerignore:1 \('\*\.txt'\)"):
+        dockerfile_requirements(path)
+    # The last rule that matches decides, as in the build: base.txt is in the image again.
+    (tmp_path / ".dockerignore").write_bytes(b"*.txt\n!requirements.txt\n!base.txt\n")
+    includes: dict = {}
+    assert dockerfile_requirements(path, includes=includes) == [(4, requirements)]
+    assert includes == {(4, requirements): (base,)}
+    # ...and a rule after that one takes it out again.
+    (tmp_path / ".dockerignore").write_bytes(b"*.txt\n!requirements.txt\n!base.txt\nbase.*\n")
+    with pytest.raises(DockerfileError, match=r":3: COPY \.: base\.txt is excluded .* \.dockerignore:4 \('base\.\*'\)"):
+        dockerfile_requirements(path)
+
+
+def test_dockerfile_requirements_refuses_a_linked_folder_when_ignore_rules_exist(tmp_path):
+    path = _context(tmp_path, _COPY_ALL + "RUN pip install -r link/req.txt\n", ["realdir/req.txt"])
+    try:
+        (tmp_path / "link").symlink_to("realdir", target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks aren't available here")
+    # The image gets realdir and the link to it, so pip reads link/req.txt.
+    assert dockerfile_requirements(path) == [(4, tmp_path / "link" / "req.txt")]
+    (tmp_path / ".dockerignore").write_bytes(b"# nothing is left out\n")
+    assert dockerfile_requirements(path) == [(4, tmp_path / "link" / "req.txt")]
+    # With realdir left out, /app/link points nowhere in the image and pip fails: realdir/req.txt isn't read.
+    (tmp_path / ".dockerignore").write_bytes(b"realdir\n")
+    with pytest.raises(
+        DockerfileError, match=":3: link is a symlink, which --dockerfile-inputs doesn't read when an ignore file has"
+    ):
+        dockerfile_requirements(path)
+
+
+def test_dockerfile_requirements_refuses_a_linked_file_when_ignore_rules_exist(tmp_path):
+    path = _context(
+        tmp_path,
+        "FROM python:3.13\nWORKDIR /app\nCOPY requirements.txt ./\nRUN pip install -r requirements.txt\n",
+        ["requirements.txt", "real.txt"],
+    )
+    requirements = tmp_path / "requirements.txt"
+    requirements.unlink()
+    try:
+        requirements.symlink_to("real.txt")
+    except OSError:
+        pytest.skip("symlinks aren't available here")
+    assert dockerfile_requirements(path) == [(4, requirements)]
+    (tmp_path / ".dockerignore").write_bytes(b"# nothing is left out\n")
+    assert dockerfile_requirements(path) == [(4, requirements)]
+    # The link is matched by its own name, but what it points to isn't in the build context.
+    (tmp_path / ".dockerignore").write_bytes(b"real.txt\n")
+    with pytest.raises(
+        DockerfileError,
+        match=r":3: COPY requirements\.txt: requirements\.txt is a symlink, .* when an ignore file has rules",
+    ):
+        dockerfile_requirements(path)
+
+
+def test_cli_dockerfile_inputs_reads_nothing_from_an_excluded_include(tmp_path, capsys, fake_pypi):
+    path = _context(tmp_path, _COPY_ALL + "RUN pip install -r requirements.txt\n", ["requirements.txt", "base.txt"])
+    (tmp_path / "requirements.txt").write_text("-r base.txt\n", encoding="utf-8")
+    (tmp_path / "base.txt").write_text("nowheels==0.9\n", encoding="utf-8")
+    (tmp_path / ".dockerignore").write_bytes(b"base.txt\n")
+    assert main(["--dockerfile", str(path), "--dockerfile-inputs", "--json"]) == 2
+    captured = capsys.readouterr()
+    assert f"{path}:3: COPY .: base.txt is excluded from the build context by .dockerignore:1 ('base.txt')" in (
+        captured.err
+    )
+    assert fake_pypi == []  # nowheels, which the image never gets, isn't looked up
+
+
 def test_cli_dockerfile_inputs_checks_what_the_image_installs(tmp_path, capsys, fake_pypi):
     path = _context(
         tmp_path,
@@ -1759,7 +2121,7 @@ def test_cli_dockerfile_inputs_context_refuses_a_symlink_out_of_the_context(tmp_
     assert fake_pypi == []
 
 
-def test_cli_dockerfile_inputs_context_refuses_dockerignore(tmp_path, capsys, fake_pypi):
+def test_cli_dockerfile_inputs_uses_the_context_and_specific_ignore_file(tmp_path, capsys, fake_pypi):
     docker_dir = tmp_path / "docker"
     docker_dir.mkdir()
     df = docker_dir / "Dockerfile"
@@ -1779,12 +2141,29 @@ def test_cli_dockerfile_inputs_context_refuses_dockerignore(tmp_path, capsys, fa
 
     (tmp_path / ".dockerignore").write_text("*.txt\n", encoding="utf-8")
     assert main(argv) == 2
-    assert f"{df}: .dockerignore may leave files out of the build context" in capsys.readouterr().err
-    (tmp_path / ".dockerignore").unlink()
+    assert (
+        f"{df}:3: COPY requirements.txt: excluded from the build context by .dockerignore:1" in capsys.readouterr().err
+    )
+
+    # An empty Dockerfile-specific file: BuildKit's built-in frontend ignores nothing, a `# syntax=` frontend falls
+    # back to .dockerignore, so wheelgap can't tell which rules the build uses.
+    (docker_dir / "Dockerfile.dockerignore").write_text("", encoding="utf-8")
+    assert main(argv) == 2
+    assert f"{df}: Dockerfile.dockerignore is empty" in capsys.readouterr().err
+    (docker_dir / "Dockerfile.dockerignore").write_text("# nothing is left out\n", encoding="utf-8")
+    assert main(argv) == 0  # the Dockerfile-specific file takes precedence
+    capsys.readouterr()
+    (tmp_path / ".dockerignore").write_text("# no rules\n", encoding="utf-8")
+    (docker_dir / "Dockerfile.dockerignore").write_text("", encoding="utf-8")
+    assert main(argv) == 0  # empty again, but .dockerignore has no rules, so nothing is left out either way
+    capsys.readouterr()
+    (tmp_path / ".dockerignore").write_text("*.json\n", encoding="utf-8")
 
     (docker_dir / "Dockerfile.dockerignore").write_text("*.txt\n", encoding="utf-8")
     assert main(argv) == 2
-    assert f"{df}: Dockerfile.dockerignore may leave files out of the build context" in capsys.readouterr().err
+    assert f"{df}:3: COPY requirements.txt: excluded from the build context by Dockerfile.dockerignore:1" in (
+        capsys.readouterr().err
+    )
 
 
 def test_cli_dockerfile_inputs_context_reads_config_from_the_context(tmp_path, capsys, fake_pypi):
