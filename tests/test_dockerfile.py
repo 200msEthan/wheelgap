@@ -9,8 +9,12 @@ from wheelgap.cli import main
 from wheelgap.dockerfile import (
     DockerfileError,
     ImageTarget,
+    InputsReport,
     UnknownImageError,
+    _env_pairs,
     _heredocs,
+    _Shell,
+    _ShellError,
     _syntax_directive,
     dockerfile_requirements,
     last_from,
@@ -1077,27 +1081,28 @@ def test_dockerfile_requirements_reads(tmp_path, dockerfile, files, expected):
     ("dockerfile", "message"),
     [
         ("FROM python:3.13\nRUN apt-get update\n", "the final stage \\(line 1\\) has no `RUN pip install -r FILE`"),
-        ("FROM python:3.13\nRUN echo hi\n", ":2: only `RUN pip install -r FILE`"),
+        ("FROM python:3.13\nRUN echo hi\n", "the final stage \\(line 1\\) has no `RUN pip install -r FILE`"),
         # A RUN that edits, replaces or removes the file between the COPY and the install.
         (
             "FROM python:3.13\nWORKDIR /app\nCOPY requirements.txt .\nRUN echo uwsgi >> requirements.txt\n"
             "RUN pip install -r requirements.txt\n",
-            ":4: only `RUN pip install",
+            ":5: requirements.txt may have been changed by line 4, which names requirements.txt",
         ),
         (
             "FROM python:3.13\nWORKDIR /app\nCOPY . .\nRUN sed -i /pywin32/d requirements.txt\n"
             "RUN pip install -r requirements.txt\n",
-            ":4: only `RUN pip install",
+            ":5: requirements.txt may have been changed by line 4, which names requirements.txt",
         ),
         (
             "FROM python:3.13\nWORKDIR /app\nCOPY . .\nRUN apt-get update && rm requirements.txt\n"
             "RUN pip install -r requirements.txt\n",
-            ":4: only `RUN pip install",
+            ":5: requirements.txt may have been changed by line 4, which names requirements.txt",
         ),
-        ("FROM python:3.13\nWORKDIR /app\nCOPY . .\nRUN python3 -mpip install uwsgi\n", ":4: only `RUN pip install"),
+        ("FROM python:3.13\nWORKDIR /app\nCOPY . .\nRUN python3 -mpip install uwsgi\n", ":4: pip install uwsgi"),
         (
-            "FROM python:3.13\nARG PIP_INDEX_URL\nWORKDIR /app\nCOPY . .\nRUN pip install -r requirements.txt\n",
-            ":2: an ARG setting PIP_ or UV_",
+            "FROM python:3.13\nARG PIP_INDEX_URL=https://user:secret@example.test/simple\nWORKDIR /app\nCOPY . .\n"
+            "RUN pip install -r requirements.txt\n",
+            ":2: ARG PIP_INDEX_URL may change what pip or uv installs$",
         ),
         (
             "ARG BASE=deps\nFROM python:3.13-slim AS deps\nWORKDIR /app\nCOPY requirements.txt .\n"
@@ -1105,20 +1110,32 @@ def test_dockerfile_requirements_reads(tmp_path, dockerfile, files, expected):
             ":6: the final stage builds on an earlier stage",
         ),
         (
-            "FROM python:3.13\nWORKDIR /app\nCOPY . .\nRUN pip install -r requirements.txt && pip check\n",
-            ":4: only `RUN pip install -r FILE`",
+            "FROM python:3.13\nWORKDIR /app\nCOPY . .\nRUN pip install -r requirements.txt && pip download six\n",
+            ":4: `pip download six`: only `install` is read of pip's commands",
         ),
         ("FROM python:3.13\nWORKDIR /app\nCOPY . .\nRUN pip install .\n", ":4: pip install \\.: --dockerfile-inputs"),
         ("FROM python:3.13\nWORKDIR /app\nCOPY . .\nRUN uv pip install -r requirements.txt\n", ":4: .*needs --system"),
-        ("FROM python:3.13\nWORKDIR /app\nCOPY . .\nRUN pip install -r $REQS\n", ":4: only `RUN"),
+        ("FROM python:3.13\nWORKDIR /app\nCOPY . .\nRUN pip install -r $REQS\n", ":4: .*\\$REQS isn't a value"),
         (
-            "FROM python:3.13\nWORKDIR /app\nCOPY . .\nRUN --mount=type=cache,target=/root/.cache pip install "
+            "FROM python:3.13\nWORKDIR /app\nCOPY . .\nRUN --mount=type=secret,id=pipconf pip install "
             "-r requirements.txt\n",
-            ":4: RUN flags such as --mount",
+            ":4: RUN --mount=type=secret with an install",
         ),
-        ("FROM python:3.13\nRUN <<EOF\npip install numpy\nEOF\n", ":2: only `RUN pip install"),
-        ("FROM python:3.13\nCOPY . .\nRUN pip install -r /requirements.txt\n", ":2: COPY to \\.: a relative"),
-        ("FROM python:3.13\nRUN pip install -r requirements.txt\n", ":2: -r requirements.txt is relative"),
+        (
+            "FROM python:3.13\nRUN <<EOF\nmake all\nEOF\n",
+            "has no `RUN pip install -r FILE` that --dockerfile-inputs can read \\(it has commands wheelgap can't see "
+            "into, which may install some: line 2\\)",
+        ),
+        # Another image may set a WORKDIR of its own.
+        (
+            "FROM ghcr.io/astral-sh/uv:python3.13-bookworm\nCOPY . .\nRUN pip install -r /requirements.txt\n",
+            ":2: COPY to \\.: a relative",
+        ),
+        # Another image may set a WORKDIR of its own.
+        (
+            "FROM ghcr.io/astral-sh/uv:python3.13-bookworm\nRUN pip install -r requirements.txt\n",
+            ":2: -r requirements.txt is relative",
+        ),
         ("FROM python:3.13\nWORKDIR /app\nRUN pip install -r requirements.txt\n", "isn't copied from the build"),
         (
             "FROM python:3.13 AS build\nCOPY . /app\nFROM build\nRUN pip install -r /app/requirements.txt\n",
@@ -1149,12 +1166,12 @@ def test_dockerfile_requirements_reads(tmp_path, dockerfile, files, expected):
         (
             "FROM python:3.13\nENV PIP_ONLY_BINARY=:all:\nWORKDIR /app\nCOPY . .\n"
             "RUN pip install -r requirements.txt\n",
-            ":2: an ENV setting PIP_ or UV_",
+            ":2: ENV PIP_ONLY_BINARY may change what pip or uv installs",
         ),
         (
-            'FROM python:3.13\nSHELL ["/bin/bash", "-c"]\nWORKDIR /app\nCOPY . .\n'
+            'FROM python:3.13\nSHELL ["/bin/bash", "-lc"]\nWORKDIR /app\nCOPY . .\n'
             "RUN pip install -r requirements.txt\n",
-            ":2: SHELL changes how RUN lines run",
+            ":2: SHELL .* changes how RUN lines run",
         ),
         ("# escape=`\nFROM python:3.13\nRUN pip install -r C:/r.txt\n", "default \\\\ escape"),
         # A frontend other than docker/dockerfile may read COPY and RUN differently.
@@ -1621,7 +1638,8 @@ def test_dockerfile_requirements_prefer_binary_needs_pins_and_no_deps(tmp_path, 
             ":4: /app/constraints.txt isn't copied from the build context",
         ),
         (
-            "FROM python:3.13\nCOPY . /app/\nRUN pip install -r /app/requirements.txt --constraint constraints.txt\n",
+            "FROM ghcr.io/astral-sh/uv:python3.13-bookworm\nCOPY . /app/\n"
+            "RUN pip install -r /app/requirements.txt --constraint constraints.txt\n",
             "purewheel==3.1\n",
             ":3: -c constraints.txt is relative, but no WORKDIR",
         ),
@@ -2025,9 +2043,9 @@ def test_cli_dockerfile_inputs_reads_uv_pip_system_install(tmp_path, capsys, fak
         ("COPY requirements.txt reqs", "uv pip install --system -r reqs", ":4: .*-r reqs: uv reads"),
         ("COPY requirements.txt ./", "uv pip install --system -r requirements.txt -c cons.py", ":4: .*-c cons.py: uv"),
         # Not this mode's commands: uv sync, uv add and uv pip sync install by other rules.
-        ("COPY requirements.txt ./", "uv sync", ":4: only `RUN pip install -r FILE`"),
-        ("COPY requirements.txt ./", "uv add -r requirements.txt", ":4: only `RUN pip install -r FILE`"),
-        ("COPY requirements.txt ./", "uv pip sync --system requirements.txt", ":4: only `RUN pip install -r FILE`"),
+        ("COPY requirements.txt ./", "uv sync", ":4: `uv sync` isn't read by --dockerfile-inputs"),
+        ("COPY requirements.txt ./", "uv add -r requirements.txt", ":4: `uv add -r requirements.txt` isn't read"),
+        ("COPY requirements.txt ./", "uv pip sync --system requirements.txt", ":4: .*only `install` is read of uv pip"),
         ("COPY requirements.txt ./", "uv pip install --system --python 3.12 -r requirements.txt", ":4: .*--python"),
         ("COPY requirements.txt ./", "uv pip install --system --index-url=https://e.test -r requirements.txt", ":4:"),
     ],
@@ -2621,9 +2639,11 @@ def test_dockerfile_requirements_refuses_a_symlink_that_overwrites_the_file(tmp_
 
 
 def test_cli_dockerfile_inputs_refuses_before_any_lookup(tmp_path, capsys, fake_pypi):
-    path = _context(tmp_path, "FROM python:3.13\nWORKDIR /app\nCOPY . .\nRUN pip install -r requirements.txt && true\n")
+    path = _context(
+        tmp_path, "FROM python:3.13\nWORKDIR /app\nCOPY . .\nRUN pip install -r requirements.txt && poetry install\n"
+    )
     assert main(["--dockerfile", str(path), "--dockerfile-inputs"]) == 2
-    assert f"{path}:4: only `RUN pip install -r FILE`" in capsys.readouterr().err
+    assert f"{path}:4: `poetry install`: poetry installs Python packages in a way" in capsys.readouterr().err
     assert fake_pypi == []
 
 
@@ -2731,6 +2751,577 @@ def test_unknown_image_error_is_a_dockerfile_error_with_the_from_line(tmp_path):
     assert excinfo.value.line == 2
 
 
+def _commands(text, env=None):
+    """(operator before, words, whether every word is exact) for each simple command of a shell line."""
+    return [
+        (c.before, [w.text for w in c.words], all(w.exact for w in c.words)) for c in _Shell(text, env or {}).parse()
+    ]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("pip install -r requirements.txt", [("", ["pip", "install", "-r", "requirements.txt"], True)]),
+        # 2.9.3: and-or lists, and ; & | between them.
+        (
+            "apt-get update && apt-get install -y gcc; pip check || true | cat & echo",
+            [
+                ("", ["apt-get", "update"], True),
+                ("&&", ["apt-get", "install", "-y", "gcc"], True),
+                (";", ["pip", "check"], True),
+                ("||", ["true"], True),
+                ("|", ["cat"], True),
+                ("&", ["echo"], True),
+            ],
+        ),
+        # 2.2 Quoting: a backslash, single quotes, double quotes (where \ only escapes $ ` " \ and a newline).
+        ("echo 'a b' \"c d\" e\\ f", [("", ["echo", "a b", "c d", "e f"], True)]),
+        ("echo \"a\\\"b\\$c\\d\" 'it'\\''s'", [("", ["echo", 'a"b$c\\d', "it's"], True)]),
+        ("pip install 'six>=1.0' \"numpy<3\" a\\>b", [("", ["pip", "install", "six>=1.0", "numpy<3", "a>b"], True)]),
+        ("echo ''", [("", ["echo", ""], True)]),
+        # 2.3: an operator ends a word wherever it is; # starts a comment only where a word would start.
+        ("a&&b;c|d", [("", ["a"], True), ("&&", ["b"], True), (";", ["c"], True), ("|", ["d"], True)]),
+        ("echo a#b # the rest", [("", ["echo", "a#b"], True)]),
+        ("echo a \\\n  b", [("", ["echo", "a", "b"], True)]),
+        ("echo a\nb", [("", ["echo", "a"], True), (";", ["b"], True)]),
+        # 2.6.2: a variable with a known value is its value; any other expansion leaves the word inexact.
+        ("pip install six==$V", [("", ["pip", "install", "six==1.16.0"], True)]),
+        ('pip install six==${V} "six==${V}" six==${V:-9}', [("", ["pip", "install", *["six==1.16.0"] * 3], True)]),
+        ("pip install six==$OTHER", [("", ["pip", "install", "six==$OTHER"], False)]),
+        ("pip install six==${OTHER:-1}", [("", ["pip", "install", "six==${OTHER:-1}"], False)]),
+        (
+            "pip install ${V:+x} ${V#1} $1 $@ $?",
+            [("", ["pip", "install", "${V:+x}", "${V#1}", "$1", "$@", "$?"], False)],
+        ),
+        ("echo '$V' \\$V $", [("", ["echo", "$V", "$V", "$"], True)]),
+        # An unquoted value with a space or a glob character is split or expanded by the shell: not taken as one word.
+        ("pip install $SPACED", [("", ["pip", "install", "$SPACED"], False)]),
+        ('pip install "$SPACED"', [("", ["pip", "install", "a b"], True)]),
+        # Assignments on the line are followed; one whose value isn't known forgets the variable.
+        ("V=2.0 && pip install six==$V", [("", [], True), ("&&", ["pip", "install", "six==2.0"], True)]),
+        (
+            "export V=3.0; pip install six==$V",
+            [("", ["export", "V=3.0"], True), (";", ["pip", "install", "six==3.0"], True)],
+        ),
+        (
+            "V=$(cat v) && pip install six==$V",
+            [("", ["cat", "v"], True), ("", [], True), ("&&", ["pip", "install", "six==$V"], False)],
+        ),
+        ("read V; pip install six==$V", [("", ["read", "V"], True), (";", ["pip", "install", "six==$V"], False)]),
+        (". ./env; pip install six==$V", [("", [".", "./env"], True), (";", ["pip", "install", "six==$V"], False)]),
+        ("V=1 pip install six", [("", ["pip", "install", "six"], True)]),
+        # 2.6.3: a command substitution's commands are commands too, and its word isn't known.
+        (
+            "pip install $(cat reqs) `echo six`",
+            [
+                ("", ["cat", "reqs"], True),
+                ("", ["echo", "six"], True),
+                ("", ["pip", "install", "$(cat reqs)", "`echo six`"], False),
+            ],
+        ),
+        (
+            "echo $((1 + 2)) \"$(echo ')')\"",
+            [("", ["echo", ")"], True), ("", ["echo", "$((1 + 2))", "$(echo ')')"], False)],
+        ),
+        # 2.13 globs, a leading tilde and bash's brace lists are expanded by the shell.
+        ("rm -rf /tmp/* ~/.cache a? [ab]c", [("", ["rm", "-rf", "/tmp/*", "~/.cache", "a?", "[ab]c"], False)]),
+        ("pip install {six,numpy} six{,}", [("", ["pip", "install", "{six,numpy}", "six{,}"], False)]),
+        (
+            "[ -f x ] && echo '*' \"?\" a~b {} x[1",
+            [("", ["[", "-f", "x", "]"], True), ("&&", ["echo", "*", "?", "a~b", "{}", "x[1"], True)],
+        ),
+        # 2.7: redirections aren't words of the command.
+        ("pip install -r r.txt > /dev/null 2>&1", [("", ["pip", "install", "-r", "r.txt"], True)]),
+        ("echo six>>r.txt 2>log <in", [("", ["echo", "six"], True)]),
+    ],
+)
+def test_shell_commands(text, expected):
+    assert _commands(text, {"V": "1.16.0", "SPACED": "a b"}) == expected
+
+
+def test_shell_redirects_assignments_and_subshells():
+    [command] = _Shell("A=1 B='x y' pip install six >> log 2>&1 < in", {}).parse()
+    assert [(name, value.text) for name, value in command.assigns] == [("A", "1"), ("B", "x y")]
+    assert [(operator, target.text) for operator, target in command.redirects] == [
+        (">>", "log"),
+        (">&", "1"),
+        ("<", "in"),
+    ]
+    shell = _Shell("(cd /src && make) && pip check", {})
+    assert [(c.words[0].text, c.subshell) for c in shell.parse()] == [("cd", True), ("make", True), ("pip", False)]
+    assert not shell.parens
+    function = _Shell("setup() { pip install six; }; setup", {})
+    function.parse()
+    assert function.parens
+
+
+@pytest.mark.parametrize("text", ["echo 'a", 'echo "a', "echo $(a", "echo `a", "cat <<EOF", "echo ${a"])
+def test_shell_refuses(text):
+    with pytest.raises(_ShellError):
+        _Shell(text, {}).parse()
+
+
+def _inputs(
+    tmp_path, body, files=("requirements.txt",), head="FROM python:3.13\nWORKDIR /app\nCOPY requirements.txt .\n"
+):
+    path = _context(tmp_path, head + body, files)
+    report = InputsReport()
+    found = dockerfile_requirements(path, report=report, uv_installs=set(), constraints={})
+    return [line for line, _ in found], report
+
+
+_INSTALL = "RUN pip install -r requirements.txt\n"
+
+
+@pytest.mark.parametrize(
+    ("body", "classes"),
+    [
+        # #652: lines after, before and around the install that install nothing.
+        (_INSTALL + "COPY . .\nRUN chmod +x entrypoint.sh && mkdir -p /data\n", {"shell": [6]}),
+        (
+            "RUN apt-get update && apt-get install -y gcc && rm -rf /var/lib/apt/lists/*\n" + _INSTALL,
+            {"system-packages": [4], "shell": [4]},
+        ),
+        (
+            "RUN DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git\n" + _INSTALL,
+            {"system-packages": [4]},
+        ),
+        (
+            "RUN export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get clean; apt-get autoremove -y\n"
+            + _INSTALL,
+            {"shell": [4], "system-packages": [4]},
+        ),
+        ("RUN apk add --no-cache build-base && adduser -D app\n" + _INSTALL, {"system-packages": [4]}),
+        (
+            "RUN curl -fsSL https://example.test/x.tgz | tar xz -C /opt && npm ci && npm run build\n" + _INSTALL,
+            {"programs": [4], "shell": [4]},
+        ),
+        (
+            "RUN git clone https://example.test/r.git /src && cd /src && cmake . && echo done > /tmp/log\n" + _INSTALL,
+            {"programs": [4], "shell": [4]},
+        ),
+        (
+            'RUN if [ "$TARGETARCH" = arm64 ]; then apt-get install -y libatlas3-base; fi\n' + _INSTALL,
+            {"shell": [4], "system-packages": [4]},
+        ),
+        ("RUN for d in a b; do mkdir -p /data/$d; done\n" + _INSTALL, {"shell": [4]}),
+        ("RUN (cd /opt && wget https://example.test/f) || true\n" + _INSTALL, {"shell": [4], "programs": [4]}),
+        ("RUN sh -c 'echo hi && mkdir /x'\n" + _INSTALL, {"shell": [4]}),
+        ('RUN ["mkdir", "-p", "/data"]\n' + _INSTALL, {"shell": [4]}),
+        ("RUN --network=none --security=sandbox ls\n" + _INSTALL, {"shell": [4]}),
+        ("RUN python -m venv /opt/venv && . /opt/venv/bin/activate\n" + _INSTALL, {"venv": [4]}),
+        ("RUN python --version; pip --version; pip list; uv --version; pip check\n" + _INSTALL, {"shell": [4]}),
+        # The install inside a chain, with its other spellings, and under a cache mount.
+        (
+            "RUN apt-get update && pip install -r requirements.txt && rm -rf /root/.cache/pip\n",
+            {"system-packages": [4], "shell": [4]},
+        ),
+        ("RUN --mount=type=cache,target=/root/.cache/pip pip3 install -r requirements.txt\n", {"cache-mounts": [4]}),
+        (
+            "ENV CACHE=/root/.cache/pip\n"
+            "RUN --mount=type=cache,target=$CACHE,sharing=locked python3 -m pip install -r requirements.txt\n",
+            {"cache-mounts": [5]},
+        ),
+        ("RUN set -eux; python -m pip install --no-cache-dir -r requirements.txt; pip check\n", {"shell": [4]}),
+        ("RUN pip --no-cache-dir install -r requirements.txt > /dev/null 2>&1\n", {}),
+        ("RUN /usr/local/bin/pip install -r /app/requirements.txt\n", {}),
+        ("RUN cd / && pip install -r app/requirements.txt\n", {"shell": [4]}),
+        ("RUN python -m venv /opt/venv && /opt/venv/bin/pip install -r requirements.txt\n", {"venv": [4]}),
+        ("RUN python -m venv .venv\nRUN .venv/bin/python -m pip install -r requirements.txt\n", {"venv": [4]}),
+        ('SHELL ["/bin/bash", "-o", "pipefail", "-c"]\n' + _INSTALL, {}),
+        ('SHELL ["bash", "-euxo", "pipefail", "-c"]\n' + _INSTALL, {}),
+        # Installer set-up is passed over, and named.
+        ("RUN pip install --no-cache-dir --upgrade pip setuptools wheel\n" + _INSTALL, {"installer-tools": [4]}),
+        (
+            "RUN python -m pip install -U 'pip>=24' uv==0.9.1 && python -m ensurepip\n" + _INSTALL,
+            {"installer-tools": [4]},
+        ),
+    ],
+)
+def test_dockerfile_requirements_passes_over_runs_that_install_nothing(tmp_path, body, classes):
+    lines, report = _inputs(tmp_path, body)
+    assert len(lines) == 1
+    assert {kind: sorted(numbers) for kind, numbers in report.passed_over.items()} == {k: v for k, v in classes.items()}
+    assert report.warnings == []
+
+
+def test_dockerfile_requirements_names_the_programs_and_tools_it_passed_over(tmp_path):
+    body = (
+        "RUN curl -O https://example.test/a && npm ci && curl -O https://example.test/b\nRUN pip install -U pip wheel\n"
+    )
+    _, report = _inputs(tmp_path, body + _INSTALL)
+    assert report.programs == ["curl", "npm"]
+    assert report.tools == ["pip", "wheel"]
+
+
+@pytest.mark.parametrize(
+    ("run", "what"),
+    [
+        ("./install.sh", "`./install.sh`, a script or program at a path"),
+        ("sh scripts/setup.sh", "`sh scripts/setup.sh`, which runs commands wheelgap can't see"),
+        ('bash -c "$SETUP"', "which runs commands wheelgap can't see"),
+        ("curl -LsSf https://example.test/install.sh | sh", "`sh`, which runs commands wheelgap can't see"),
+        ("make install", "`make install`, which runs commands wheelgap can't see"),
+        ("python manage.py collectstatic --noinput", "`python manage.py collectstatic --noinput`, a Python script"),
+        ("python -c 'import nltk; nltk.download(\"punkt\")'", "Python code wheelgap doesn't look into"),
+        ("python -m spacy download en_core_web_sm", "`python -m spacy download en_core_web_sm`, a Python module"),
+        ("mytool --setup", "`mytool --setup`, a program wheelgap doesn't know"),
+        ("$TOOL build", "a command name wheelgap can't resolve"),
+        ("find . -name '*.sh' -exec sh {} +", "which runs commands wheelgap can't see"),
+        ("echo a | xargs something", "`xargs something`, which runs commands wheelgap can't see"),
+        ('eval "$CMD"', "which runs commands wheelgap can't see"),
+        ("case $TARGETARCH in arm64) echo a ;; esac", "a `case` command list"),
+        ("setup() { echo hi; }; setup", "a `name()` command list"),
+        ("sudo -u app ./run", "a command name wheelgap can't resolve"),
+        ("<<EOF\necho hi\nEOF", "a heredoc script"),
+    ],
+)
+def test_dockerfile_requirements_warns_about_runs_it_cant_see_into(tmp_path, run, what):
+    lines, report = _inputs(tmp_path, f"{_INSTALL}RUN {run}\n")
+    assert lines == [4]  # the answer is still given
+    [(line, text)] = report.warnings
+    assert line == 5
+    assert what in text
+
+
+@pytest.mark.parametrize(
+    ("body", "error"),
+    [
+        # Lines that install Python packages in a way that isn't read are never passed over.
+        (
+            _INSTALL + "RUN poetry install --no-root\n",
+            ":5: `poetry install --no-root`: poetry installs Python packages",
+        ),
+        (_INSTALL + "RUN conda install -y numpy\n", ":5: `conda install -y numpy`: conda installs"),
+        (_INSTALL + "RUN pipx install black && pdm sync\n", ":5: `pipx install black`: pipx installs"),
+        (_INSTALL + "RUN python setup.py install\n", ":5: `python setup.py install` installs or builds a project"),
+        (_INSTALL + "RUN uv sync --locked\n", ":5: `uv sync --locked` isn't read"),
+        (_INSTALL + "RUN uv run pytest\n", ":5: `uv run pytest` isn't read"),
+        (_INSTALL + "RUN pip uninstall -y six\n", ":5: `pip uninstall -y six`: only `install` is read of pip's"),
+        (_INSTALL + "RUN pip config set global.index-url https://example.test\n", ":5: `pip config set"),
+        (
+            _INSTALL + "RUN /opt/conda/bin/pip install -r requirements.txt\n",
+            ":5: .*which Python /opt/conda/bin/pip belongs to",
+        ),
+        (_INSTALL + "RUN /venv/bin/python -m pip install -r requirements.txt\n", ":5: .*which Python /venv/bin/python"),
+        (_INSTALL + "RUN apt-get update && pip install numpy\n", ":5: pip install numpy"),
+        (_INSTALL + "RUN pip install .\n", ":5: pip install \\."),
+        (_INSTALL + "RUN pip install -r requirements.txt pip\n", ":5: pip install pip"),
+        # An install that may not run, or may fail without failing the build.
+        (
+            "RUN pip install -r requirements.txt || true\n",
+            ":4: `pip install -r requirements.txt` is in a list with \\|\\|",
+        ),
+        ("RUN test -f x || echo no && pip install -r requirements.txt\n", ":4: .* is in a list with \\|\\|"),
+        (
+            "RUN if [ -f requirements.txt ]; then pip install -r requirements.txt; fi\n",
+            ":4: .* is inside if, for, while or { }",
+        ),
+        ("RUN for f in a b; do pip install -r requirements.txt; done\n", ":4: .* is inside if"),
+        ("RUN { pip install -r requirements.txt; }\n", ":4: .* is inside if"),
+        ("RUN (pip install -r requirements.txt)\n", ":4: .* is inside \\( \\)"),
+        ("RUN yes | pip install -r requirements.txt\n", ":4: .* is part of a pipeline"),
+        ("RUN pip install -r requirements.txt &\n", ":4: .* is run in the background"),
+        ("RUN echo $(pip install -r requirements.txt)\n", ":4: .* is inside a command substitution"),
+        ("RUN sh -c 'pip install -r requirements.txt'\n", ":4: .* is inside a command substitution or `sh -c`"),
+        ("RUN pip install -r requirements.txt < /dev/null\n", ":4: .* reads its input from a redirect"),
+        ("RUN case $A in x) pip install -r requirements.txt ;; esac\n", ":4: this RUN names pip inside `case`"),
+        ("RUN f() { pip install -r requirements.txt; }; f\n", ":4: this RUN names pip inside `name\\(\\)`"),
+        # What the install reads must be known.
+        ("RUN pip install -r $REQS\n", ":4: .*\\$REQS isn't a value"),
+        ("RUN pip install -r *.txt\n", ":4: .*\\*.txt isn't a value"),
+        ("RUN pip install -r $(ls *.txt)\n", ":4: .* isn't a value"),
+        ("RUN cd $SRC && pip install -r requirements.txt\n", ":4: the folder after `cd \\$SRC` isn't known"),
+        ("RUN (cd /) && pip install -r app/requirements.txt\n", ":4: the folder after `cd /` isn't known"),
+        ("RUN $PIP install -r requirements.txt\nRUN pip install -r missing.txt\n", ":4: this line runs `\\$PIP"),
+        ("RUN pip install -r 'requirements.txt\n", ":4: this RUN has an unterminated ' quote"),
+        # Settings and mounts on the RUN itself.
+        (
+            "RUN PIP_INDEX_URL=https://example.test/simple pip install -r requirements.txt\n",
+            ":4: PIP_INDEX_URL is set on this RUN",
+        ),
+        ("RUN export UV_PRERELEASE=allow && pip install -r requirements.txt\n", ":4: UV_PRERELEASE is set on this RUN"),
+        ("RUN env PIP_PRE=1 pip install -r requirements.txt\n", ":4: PIP_PRE is set on this RUN"),
+        (
+            "RUN --mount=type=bind,source=requirements.txt,target=/r.txt pip install -r /r.txt\n",
+            ":4: RUN --mount=type=bind with an install",
+        ),
+        (
+            "RUN --mount=source=.,target=/src pip install -r requirements.txt\n",
+            ":4: RUN --mount=type=bind with an install",
+        ),
+        ("RUN --mount=type=ssh pip install -r requirements.txt\n", ":4: RUN --mount=type=ssh with an install"),
+        ("RUN --mount=type=$KIND pip install -r requirements.txt\n", ":4: RUN --mount with a variable for its type"),
+        (
+            "RUN --mount=type=cache,target='/a b' pip install -r requirements.txt\n",
+            ":4: RUN flags with quotes or escapes",
+        ),
+        ("RUN --device=gpu pip install -r requirements.txt\n", ":4: RUN --device isn't a RUN flag"),
+        # A command that isn't read, before the install, that may have changed the file or written pip's config.
+        (
+            "RUN sed -i s/six/seven/ requirements.txt\n" + _INSTALL,
+            ":5: requirements.txt may have been changed by line 4",
+        ),
+        (
+            "RUN curl -o /app/requirements.txt https://example.test/r\n" + _INSTALL,
+            ":5: requirements.txt may have been changed by line 4",
+        ),
+        (
+            "RUN cp /other/*.txt /app/\n" + _INSTALL,
+            ":5: requirements.txt may have been changed by line 4, which names /app/",
+        ),
+        (
+            "RUN git clone https://example.test/r.git .\n" + _INSTALL,
+            ":5: requirements.txt may have been changed by line 4, which names \\.",
+        ),
+        (
+            "RUN echo six > req*.txt\n" + _INSTALL,
+            ":5: requirements.txt may have been changed by line 4, which names req\\*.txt",
+        ),
+        (
+            "RUN ./gen.sh requirements.txt && pip install -r requirements.txt\n",
+            ":4: this line runs `./gen.sh requirements.txt`, a script .* before the install on the same line",
+        ),
+        (
+            "RUN printf '[global]\\nindex-url = https://example.test\\n' > /etc/pip.conf\n" + _INSTALL,
+            ":4: .* names /etc/pip.conf, which may be a pip or uv config file",
+        ),
+        (
+            "RUN mkdir -p ~/.config/pip && cp /mnt/conf ~/.config/pip/pip.conf\n" + _INSTALL,
+            ":4: .* names ~/.config/pip/pip.conf",
+        ),
+        ("RUN wget -O /root/.netrc https://example.test/n\n" + _INSTALL, ":4: .* names /root/.netrc"),
+    ],
+)
+def test_dockerfile_requirements_stops_on_runs_that_may_change_the_answer(tmp_path, body, error):
+    with pytest.raises(DockerfileError, match=error):
+        _inputs(tmp_path, body)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # After the install, or naming something else, or only reading: the file is what COPY put there.
+        _INSTALL + "RUN rm requirements.txt && sed -i s/a/b/ requirements.txt\n",
+        "RUN cat requirements.txt && ls -l /app && grep six requirements.txt && chmod 644 requirements.txt\n"
+        + _INSTALL,
+        "RUN rm -rf /tmp/* /var/lib/apt/lists/* && find / -name '*.pyc' -delete\n" + _INSTALL,
+        "RUN sed -i s/a/b/ other.txt && cp /x/*.cfg /etc/\n" + _INSTALL,
+    ],
+)
+def test_dockerfile_requirements_reads_a_file_no_unread_command_may_have_changed(tmp_path, body):
+    lines, _ = _inputs(tmp_path, body)
+    assert len(lines) == 1
+
+
+_SETTINGS = (
+    "PIP_NO_CACHE_DIR PIP_CACHE_DIR PIP_DISABLE_PIP_VERSION_CHECK PIP_ROOT_USER_ACTION PIP_NO_INPUT PIP_PROGRESS_BAR "
+    "PIP_NO_COLOR PIP_DEFAULT_TIMEOUT PIP_TIMEOUT PIP_RETRIES PIP_QUIET PIP_VERBOSE PIP_NO_WARN_SCRIPT_LOCATION "
+    "PIP_NO_COMPILE PIP_COMPILE PIP_BREAK_SYSTEM_PACKAGES PIP_NO_PYTHON_VERSION_WARNING UV_NO_CACHE UV_CACHE_DIR "
+    "UV_COMPILE_BYTECODE UV_LINK_MODE UV_NO_PROGRESS UV_HTTP_TIMEOUT UV_HTTP_RETRIES UV_CONCURRENT_DOWNLOADS "
+    "UV_CONCURRENT_BUILDS UV_CONCURRENT_INSTALLS UV_PYTHON_DOWNLOADS UV_PYTHON_INSTALL_DIR UV_TOOL_BIN_DIR UV_TOOL_DIR "
+    "UV_INSTALL_DIR UV_BREAK_SYSTEM_PACKAGES UV_PROJECT_ENVIRONMENT UV_SYSTEM_PYTHON UV_SYSTEM_CERTS UV_VERSION "
+    "PYTHONUNBUFFERED "
+    "pip_index_url NOTE"
+).split()
+
+
+@pytest.mark.parametrize("name", _SETTINGS)
+@pytest.mark.parametrize(
+    "form", ["ENV {}=1", "ENV {} 1", "ARG {}=1", "ARG {}", "ENV A=1 {}=copy B=2", 'ENV {}="see PIP_INDEX_URL docs"']
+)
+def test_dockerfile_requirements_reads_settings_that_dont_change_what_is_installed(tmp_path, name, form):
+    lines, report = _inputs(tmp_path, form.format(name) + "\n" + _INSTALL)
+    assert lines == [5]
+    assert report.notes == []
+
+
+_RISKY = (
+    "PIP_INDEX_URL PIP_EXTRA_INDEX_URL PIP_NO_BINARY PIP_ONLY_BINARY PIP_CONSTRAINT PIP_PRE PIP_PREFER_BINARY "
+    "PIP_REQUIRE_HASHES PIP_FIND_LINKS PIP_NO_INDEX PIP_TRUSTED_HOST PIP_CONFIG_FILE PIP_USER PIP_TARGET PIP_PYTHON "
+    "PIP_NO_DEPS PIP_UPGRADE_STRATEGY PIP_USE_FEATURE PIP_VERSION PIP_SOMETHING_NEW PIP_index_url UV_INDEX "
+    "UV_INDEX_URL UV_DEFAULT_INDEX UV_EXTRA_INDEX_URL UV_FIND_LINKS UV_INDEX_STRATEGY UV_NO_BINARY "
+    "UV_NO_BINARY_PACKAGE UV_NO_BUILD UV_PRERELEASE UV_RESOLUTION UV_EXCLUDE_NEWER UV_CONSTRAINT UV_OVERRIDE "
+    "UV_PYTHON UV_PYTHON_PREFERENCE UV_CONFIG_FILE UV_NO_CONFIG UV_TORCH_BACKEND UV_SOMETHING_NEW"
+).split()
+
+
+@pytest.mark.parametrize("name", _RISKY)
+@pytest.mark.parametrize("form", ["ENV {}=1", "ENV {} 1", "ARG {}=1", "ENV A=1 {}=$A", "ENV {}="])
+def test_dockerfile_requirements_stops_on_settings_that_may_change_what_is_installed(tmp_path, name, form):
+    with pytest.raises(DockerfileError, match=f":4: (ENV|ARG) {name} may change what pip or uv installs$"):
+        _inputs(tmp_path, form.format(name) + "\n" + _INSTALL)
+    # After the last install it changes nothing that was read.
+    lines, _ = _inputs(tmp_path, _INSTALL + form.format(name) + "\n")
+    assert lines == [4]
+
+
+def test_dockerfile_requirements_settings_edge_cases(tmp_path):
+    # An ARG with no default isn't in the RUN's environment: read as built without --build-arg, with a note.
+    lines, report = _inputs(tmp_path, "ARG PIP_INDEX_URL\nARG UV_INDEX_URL PIP_EXTRA_INDEX_URL\n" + _INSTALL)
+    assert lines == [6]
+    assert [(line, kind) for line, kind, _ in report.notes] == [(4, "arg-unset"), (5, "arg-unset"), (5, "arg-unset")]
+    assert "read as run without --build-arg PIP_INDEX_URL" in report.notes[0][2]
+    # A --build-arg gives it a value, and so does a global ARG's default.
+    path = tmp_path / "Dockerfile"
+    with pytest.raises(DockerfileError, match=":4: ARG PIP_INDEX_URL may change"):
+        dockerfile_requirements(path, {"PIP_INDEX_URL": "https://example.test/simple"})
+    path.write_text(
+        "ARG PIP_PRE=1\nFROM python:3.13\nARG PIP_PRE\nWORKDIR /app\nCOPY . .\n" + _INSTALL, encoding="utf-8"
+    )
+    with pytest.raises(DockerfileError, match=":3: ARG PIP_PRE may change"):
+        dockerfile_requirements(path)
+    # An ENV or ARG wheelgap can't split into names is refused as before when PIP_ or UV_ is anywhere in it.
+    for line in ('ENV A="x\\"" PIP_PRE=1', "ENV --unset PIP_PRE", "ARG PIP_PRE=a\\ b"):
+        path.write_text(f"FROM python:3.13\n{line}\nWORKDIR /app\nCOPY . .\n" + _INSTALL, encoding="utf-8")
+        with pytest.raises(DockerfileError, match=":2: an (ENV|ARG) setting PIP_ or UV_ variables"):
+            dockerfile_requirements(path)
+
+
+def test_env_pairs_follow_buildkit():
+    assert _env_pairs("ENV", "A=1 B='x y' C=\"z\"", {}, {}) == [
+        ("A", "1", False),
+        ("B", "x y", False),
+        ("C", "z", False),
+    ]
+    assert _env_pairs("ENV", "PATH /opt/venv/bin:$PATH", {}, {}) == [("PATH", None, False)]
+    assert _env_pairs("ENV", "NAME some  value", {}, {}) == [("NAME", "some  value", False)]
+    assert _env_pairs("ENV", "A=1 B", {}, {}) is None  # Docker: can't find = in "B"
+    assert _env_pairs("ENV", "ONLY", {}, {}) is None  # Docker: ENV must have two arguments
+    assert _env_pairs("ARG", "A B=2 C", {"A": "x", "B": "y"}, {"C": "z"}) == [
+        ("A", "x", False),
+        ("B", "y", False),
+        ("C", "z", False),
+    ]
+    assert _env_pairs("ARG", "A B=$A", {}, {}) == [("A", None, True), ("B", None, False)]
+
+
+@pytest.mark.parametrize(
+    ("env", "run", "error"),
+    [
+        ("ENV UV_SYSTEM_PYTHON=1", "uv pip install -r requirements.txt", None),
+        ("ENV UV_SYSTEM_PYTHON=true", "uv pip install --no-cache -r requirements.txt", None),
+        ("ENV UV_SYSTEM_PYTHON=0", "uv pip install -r requirements.txt", ":6: uv pip install needs --system"),
+        ("ENV UV_SYSTEM_PYTHON=$X", "uv pip install -r requirements.txt", ":6: uv pip install needs --system"),
+        (
+            "ENV NOTE=1",
+            "uv pip install -r requirements.txt",
+            ":6: uv pip install needs --system \\(or ENV UV_SYSTEM_PYTHON=1\\)",
+        ),
+    ],
+)
+def test_dockerfile_requirements_reads_uv_system_python(tmp_path, env, run, error):
+    body = f"COPY --from=ghcr.io/astral-sh/uv:0.9.1 /uv /uvx /bin/\n{env}\nRUN {run}\n"
+    if error is None:
+        assert _inputs(tmp_path, body)[0] == [6]
+    else:
+        with pytest.raises(DockerfileError, match=error):
+            _inputs(tmp_path, body)
+
+
+def test_dockerfile_requirements_expands_env_and_arg_in_a_run(tmp_path):
+    body = 'ENV REQS=requirements.txt DIR=/app\nARG NAME=requirements\nRUN pip install -r $DIR/${NAME}.txt -c "$REQS"\n'
+    path = _context(tmp_path, "FROM python:3.13\nCOPY requirements.txt /app/\nWORKDIR /app\n" + body)
+    constraints = {}
+    assert dockerfile_requirements(path, constraints=constraints) == [(6, tmp_path / "requirements.txt")]
+    assert constraints == {tmp_path / "requirements.txt": (tmp_path / "requirements.txt",)}
+    # --build-arg replaces the ARG's default, as in the build.
+    with pytest.raises(DockerfileError, match=":6: /app/other.txt isn't copied"):
+        dockerfile_requirements(path, {"NAME": "other"}, constraints={})
+
+
+def test_cli_dockerfile_inputs_says_what_it_passed_over_and_what_it_cant_see(tmp_path, capsys, fake_pypi):
+    path = _context(
+        tmp_path,
+        "FROM python:3.13\nRUN apt-get update && apt-get install -y gcc\nRUN pip install -U pip\nWORKDIR /app\n"
+        "COPY requirements.txt .\nRUN --mount=type=cache,target=/root/.cache/pip pip install -r requirements.txt\n"
+        "ARG PIP_INDEX_URL\nRUN curl -O https://example.test/x && ./install.sh\nRUN make assets\n",
+    )
+    argv = ["--dockerfile", str(path), "--dockerfile-inputs"]
+    assert main(argv) == 0
+    captured = capsys.readouterr()
+    for note in (
+        f"note: {path}: not read, since they install no Python packages with pip or uv: system package and account "
+        "commands, line 2\n",
+        f"note: {path}: not read, since they install no Python packages with pip or uv: other programs (curl), "
+        "line 8\n",
+        f"note: {path}: not read, since they install no Python packages with pip or uv: cache mounts, line 6\n",
+        f"note: {path}: line 3 install or upgrade installer tools (pip): these and what they depend on aren't "
+        "checked, and the pip version the later lines run isn't known",
+        f"note: {path}:7: ARG PIP_INDEX_URL has no default, so the build is read as run without --build-arg",
+        f"warning: {path}:8: this line runs `./install.sh`, a script or program at a path. If it installs Python "
+        "packages, or another Python, that is not in this answer\n",
+        f"warning: {path}:9: this line runs `make assets`, which runs commands wheelgap can't see.",
+    ):
+        assert note in captured.err
+    # The report itself ends with it, so a green tick can't be read as "everything this image installs".
+    unseen = (
+        f"{path} lines 8, 9 run commands wheelgap can't see into: any Python packages they install are not in "
+        "this answer."
+    )
+    assert captured.out.rstrip().endswith(f"! {unseen}")
+    # --quiet drops the notes and keeps the warnings, on stderr and in the report.
+    assert main([*argv, "--quiet"]) == 0
+    captured = capsys.readouterr()
+    assert "note:" not in captured.err
+    assert captured.err.count("wheelgap: warning: ") == 2
+    assert captured.out.strip() == f"! {unseen}"
+    assert main([*argv, "--markdown"]) == 0
+    assert capsys.readouterr().out.rstrip().endswith(f"> **Warning:** {unseen}")
+    assert main([*argv, "--json", "--quiet"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert [(w["line"], w["kind"]) for w in data["dockerfile_warnings"]] == [(8, "may-install"), (9, "may-install")]
+    assert "`make assets`" in data["dockerfile_warnings"][1]["message"]
+    assert [(n["kind"], n.get("lines"), n["line"]) for n in data["dockerfile_notes"]] == [
+        ("passed-over:system-packages", [2], None),
+        ("passed-over:programs", [8], None),
+        ("passed-over:cache-mounts", [6], None),
+        ("passed-over:installer-tools", [3], None),
+        ("arg-unset", None, 7),
+    ]
+
+
+def test_cli_dockerfile_inputs_json_has_no_warnings_when_every_run_is_read(tmp_path, capsys, fake_pypi):
+    path = _context(tmp_path, "FROM python:3.13\nWORKDIR /app\nCOPY requirements.txt .\n" + _INSTALL)
+    assert main(["--dockerfile", str(path), "--dockerfile-inputs", "--json"]) == 0
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)
+    assert data["dockerfile_warnings"] == []
+    assert "dockerfile_notes" not in data
+    assert "warning" not in captured.err
+    # Without --dockerfile-inputs nothing is read from the RUN lines, so there is no key.
+    assert main(["purewheel", "--dockerfile", str(path), "--json"]) == 0
+    assert "dockerfile_warnings" not in json.loads(capsys.readouterr().out)
+
+
+def test_cli_dockerfile_inputs_says_when_the_system_package_manager_installs_python_packages(
+    tmp_path, capsys, fake_pypi
+):
+    path = _context(
+        tmp_path,
+        "FROM python:3.13-alpine\nRUN apk add --no-cache git py3-yaml py3-gevent py3-pip python3-dev\n"
+        "RUN apt-get install -y python3 python3.12-venv python3-numpy python-is-python3 && apk add py3-yaml\n"
+        "WORKDIR /app\nCOPY requirements.txt .\n" + _INSTALL,
+    )
+    assert main(["--dockerfile", str(path), "--dockerfile-inputs", "--json"]) == 0
+    captured = capsys.readouterr()
+    [note] = [n for n in json.loads(captured.out)["dockerfile_notes"] if n["kind"] == "system-python-packages"]
+    assert note["lines"] == [2, 3]
+    assert (
+        "lines 2, 3 install Python packages with the system package manager (py3-yaml, py3-gevent, python3-numpy)"
+        in (note["message"])
+    )
+    assert "pip keeps one of those when it satisfies a requirement" in captured.err
+    # None of these is one: the interpreter's own pieces, and the installer.
+    path.write_text(
+        "FROM python:3.13\nRUN apt-get install -y python3 python3-pip python3-dev python3.12-venv python3-setuptools\n"
+        "WORKDIR /app\nCOPY requirements.txt .\n" + _INSTALL,
+        encoding="utf-8",
+    )
+    assert main(["--dockerfile", str(path), "--dockerfile-inputs", "--json"]) == 0
+    assert "system-python-packages" not in capsys.readouterr().out
+
+
 def test_cli_dockerfile_unread_image_note_names_what_the_image_may_change(tmp_path, capsys, fake_pypi):
     # python:3-onbuild runs its own `pip install -r requirements.txt` in this build, and an image may set PIP_ values.
     path = _context(
@@ -2781,3 +3372,412 @@ def test_cli_dockerfile_unread_image_note_in_markdown_annotations_and_sarif(tmp_
     assert main(["purewheel", "-p", "3.13", "-t", "linux-x86_64", "--sarif", str(sarif)]) == 0
     rules = json.loads(sarif.read_text(encoding="utf-8"))["runs"][0]["tool"]["driver"]["rules"]
     assert [rule["id"] for rule in rules] == ["wheelgap/source", "wheelgap/missing"]
+
+
+# Review of the stack (#657): a line wheelgap can't see into stops when an install it reads comes after it, and the
+# shell shapes that make an install not run, or run another pip, stop too.
+_BEFORE_INSTALL = [
+    # Lines wheelgap can't see into, before the install: they may rewrite the file, write a pip.conf, set PIP_ values.
+    ("RUN ./setup.sh\n" + _INSTALL, ":4: this line runs `./setup.sh`, a script .* before the install on line 5"),
+    ("RUN make deps && pip install -r requirements.txt\n", ":4: this line runs `make deps`.* on the same line"),
+    ("RUN python manage.py migrate\n" + _INSTALL, ":4: this line runs `python manage.py migrate`"),
+    ("RUN python -c 'import os'\n" + _INSTALL, ":4: this line runs `python -c"),
+    ("RUN frobnicate --all\n" + _INSTALL, ":4: this line runs `frobnicate --all`, a program wheelgap doesn't know"),
+    ("RUN dpkg -i /tmp/x.deb\n" + _INSTALL, ":4: this line runs `dpkg -i /tmp/x.deb`, which installs a package file"),
+    ("RUN apt-get install -y ./x.deb\n" + _INSTALL, ":4: .*which installs a package file"),
+    ("RUN rpm -Uvh /tmp/x.rpm\n" + _INSTALL, ":4: .*which installs a package file"),
+    ("RUN apk add --allow-untrusted /tmp/x.apk\n" + _INSTALL, ":4: .*which installs a package file"),
+    ('ENV PATH "/opt/x/bin:$PATH"\n' + _INSTALL, ":5: .*ENV PATH on line 4 puts /opt/x/bin first"),
+    ("RUN bash -c 'pip install six' _\n" + _INSTALL, ":4: this line runs `bash -c"),
+    ("RUN bash -lc 'pip install six'\n" + _INSTALL, ":4: this line runs `bash -lc"),
+    ("RUN su -c 'pip install six' root\n" + _INSTALL, ":4: this line runs `su -c"),
+    ("RUN timeout 600 pip install six\n" + _INSTALL, ":4: this line runs `timeout 600"),
+    ("RUN sudo -H pip install six\n" + _INSTALL, ":4: this line runs `sudo -H"),
+    ("RUN awk 'BEGIN{system(\"pip install six\")}'\n" + _INSTALL, ":4: this line runs `awk"),
+    # M1: heredocs. One that names an installer stops wherever it is; any other before an install stops too.
+    ("RUN <<EOF\necho 'idna==3.10' > requirements.txt\nEOF\n" + _INSTALL, ":4: this line runs a heredoc script"),
+    (
+        "RUN cat > /etc/pip.conf <<EOF\n[global]\nindex-url = https://example.invalid/simple\nEOF\n" + _INSTALL,
+        ":4: this line runs a heredoc script",
+    ),
+    ("RUN <<EOF\npip install idna==3.10\nEOF\n" + _INSTALL, ":4: this RUN's heredoc names pip"),
+    (_INSTALL + "RUN <<EOF\npython3 -m pip install idna\nEOF\n", ":5: this RUN's heredoc names python3"),
+    (_INSTALL + "RUN python3 <<EOF\nprint(1)\nEOF\n", ":5: this RUN's heredoc names python3"),
+    # M2: under sh, `&>` is `&` then `>`: pip runs in the background and the RUN doesn't wait for it.
+    ("RUN pip install -r requirements.txt &> /dev/null\n", ":4: .* is run in the background"),
+    ("RUN pip install -r requirements.txt &>> /tmp/log\n", ":4: .* is run in the background"),
+    ("RUN sh -c 'pip install -r requirements.txt &> /dev/null'\n", ":4: .*inside a command substitution or `sh -c`"),
+    # M3: installs that may not run while the build goes on.
+    ('ARG MODE=prod\nRUN [ "$MODE" = dev ] && pip install -r requirements.txt; echo done\n', ":5: .*after &&"),
+    ("RUN false && pip install -r requirements.txt; true\n", ":4: .*after && in a list that isn't the RUN's last"),
+    (
+        "RUN apt-get update && pip install -r requirements.txt\nRUN echo\n"
+        if False
+        else "RUN apt-get update && pip install -r requirements.txt &\n",
+        ":4: .*run in the background",
+    ),
+    ("RUN exit 0; pip install -r requirements.txt\n", ":4: .*after `exit` on the same RUN"),
+    ("RUN if true; then exit 0; fi; pip install -r requirements.txt\n", ":4: .*after `exit` on the same RUN"),
+    ("RUN ! pip install -r requirements.txt\n", ":4: .*negated with `!`"),
+    # M4: settings made in ways other than `export NAME=value`.
+    (
+        'SHELL ["/bin/bash", "-c"]\nRUN declare -x PIP_INDEX_URL=https://example.invalid/simple '
+        "&& pip install -r requirements.txt\n",
+        ":5: PIP_INDEX_URL is set on this RUN",
+    ),
+    ("RUN typeset -x PIP_INDEX_URL=https://example.invalid/simple && pip install -r requirements.txt\n", ":4: PIP_"),
+    ("RUN . ./env.sh && pip install -r requirements.txt\n", ":4: this line runs `. ./env.sh`"),
+    ('RUN eval "export PIP_INDEX_URL=x" && pip install -r requirements.txt\n', ":4: this line runs `eval"),
+    ("RUN export $(cat .env | xargs) && pip install -r requirements.txt\n", ":4: `export \\$\\(cat .env"),
+    ("RUN export $OPTIONS && pip install -r requirements.txt\n", ":4: `export \\$OPTIONS` may set any variable"),
+    # M5: archives, patches and git write files they don't name.
+    (
+        "RUN tar xzf /tmp/src.tgz && pip install -r requirements.txt\n",
+        ":4: requirements.txt may have been changed by line 4, which names \\.",
+    ),
+    (
+        "RUN tar -xzf /tmp/src.tgz -C /app\n" + _INSTALL,
+        ":5: requirements.txt may have been changed by line 4, which names /app",
+    ),
+    ("RUN unzip -o /tmp/src.zip\n" + _INSTALL, ":5: .* changed by line 4, which names \\."),
+    ("RUN patch -p1 < /tmp/fix.patch\n" + _INSTALL, ":5: .* changed by line 4, which names \\."),
+    ("RUN cpio -i < /tmp/a.cpio && pip install -r requirements.txt\n", ":4: this line runs `cpio"),
+    ("RUN git checkout v2\n" + _INSTALL, ":5: .* changed by line 4, which may change files anywhere"),
+    ("RUN git -C /src pull\n" + _INSTALL, ":5: .* changed by line 4, which may change files anywhere"),
+    # M6: another Python than the image's.
+    ("RUN /usr/bin/python3 -m pip install -r requirements.txt\n", ":4: .*doesn't know which Python /usr/bin/python3"),
+    ("RUN /usr/bin/pip3 install -r requirements.txt\n", ":4: .*doesn't know which Python /usr/bin/pip3"),
+    ("ENV PATH=/root/.local/bin:$PATH\n" + _INSTALL, ":5: .*ENV PATH on line 4 puts /root/.local/bin first"),
+    ("ENV PATH /opt/conda/bin:$PATH\n" + _INSTALL, ":5: .*puts /opt/conda/bin first"),
+    ("RUN export PATH=/opt/x/bin:$PATH && pip install -r requirements.txt\n", ":4: .*line 4 puts /opt/x/bin first"),
+    ("RUN PATH=/opt/x/bin:$PATH pip install -r requirements.txt\n", ":4: .*puts /opt/x/bin first"),
+    ("RUN . /opt/venv/bin/activate && pip install -r requirements.txt\n", ":4: .*puts /opt/venv/bin first"),
+    ("ENV PATH=/opt/x/bin:$PATH\nRUN uv pip install --system -r requirements.txt\n", ":5: .*puts /opt/x/bin first"),
+    ("ARG PATH=/opt/x/bin\n" + _INSTALL, ":5: .*the ARG on line 4 sets PATH"),
+    # Config folders written whole, and mounts over the working folder or a config folder.
+    ("RUN cp -r /tmp/etc/. /etc/\n" + _INSTALL, ":4: `cp -r /tmp/etc/. /etc/` writes into /etc/"),
+    ("RUN cp -r /tmp/cfg/. /root/.config/\n" + _INSTALL, ":4: .* writes into /root/.config/"),
+    ("RUN mv /tmp/.config /root/\n" + _INSTALL, ":4: .* writes into /root/"),
+    ("RUN mv /tmp/cfg /root/.config\n" + _INSTALL, ":4: .* writes into /root/.config"),
+    ("RUN ln -s /run/secrets/pip /etc/xdg/pip\n" + _INSTALL, ":4: .* names /etc/xdg/pip, which may be a pip"),
+    (
+        "RUN --mount=type=cache,target=/app pip install -r requirements.txt\n",
+        ":4: a cache or tmpfs mount over /app covers /app/requirements.txt",
+    ),
+    (
+        "RUN --mount=type=tmpfs,target=/etc/xdg/pip pip install -r requirements.txt\n",
+        ":4: a cache or tmpfs mount over /etc/xdg/pip may put a pip config",
+    ),
+    (
+        "RUN --mount=type=cache,dst=/root/.config pip install -r requirements.txt\n",
+        ":4: a cache or tmpfs mount over /root/.config",
+    ),
+    (
+        "RUN --mount=type=cache,target=$NOWHERE pip install -r requirements.txt\n",
+        ":4: wheelgap can't tell which folder",
+    ),
+    # A pip that isn't the newest picks files by other rules.
+    (
+        "RUN pip install pip==19.3.1\n" + _INSTALL,
+        ":4: this line runs `pip install pip==19.3.1`, which installs a pip version",
+    ),
+    ("RUN pip install 'pip<24' setuptools\n" + _INSTALL, ":4: .*installs a pip version wheelgap doesn't answer for"),
+    # A name an ENV and then an ARG set: BuildKit gives the ARG's value, the classic builder the ENV's.
+    (
+        "ENV REQ=requirements.txt\nARG REQ=other.txt\nRUN pip install -r $REQ\n",
+        ":6: .*REQ is set by an ENV and then by the ARG on line 5",
+    ),
+    (
+        # Read as unset: BuildKit's 1 would be --system, the classic builder's 0 isn't.
+        "ENV UV_SYSTEM_PYTHON=0\nARG UV_SYSTEM_PYTHON=1\nRUN uv pip install -r requirements.txt\n",
+        ":6: uv pip install needs --system",
+    ),
+]
+
+
+@pytest.mark.parametrize(("body", "error"), _BEFORE_INSTALL)
+def test_dockerfile_requirements_stops_on_review_cases(tmp_path, body, error):
+    with pytest.raises(DockerfileError, match=error):
+        _inputs(tmp_path, body)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # After the last install, the same lines are only warnings: they can't change what the read install fetched.
+        _INSTALL + "RUN ./setup.sh\n",
+        _INSTALL + "RUN <<EOF\necho hi > /tmp/x\nEOF\n",
+        _INSTALL + "RUN pip install pip==19.3.1\n",
+        _INSTALL + "RUN awk 'BEGIN{system(\"pip install six\")}'\n",
+        _INSTALL + "RUN timeout 600 pip install six\n",
+    ],
+)
+def test_dockerfile_requirements_warns_after_the_last_install(tmp_path, body):
+    lines, report = _inputs(tmp_path, body)
+    assert lines == [4]
+    assert [line for line, _ in report.warnings] == [5]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # bash reads &> as a redirect; ARG then ENV gives the ENV's value in every builder.
+        'SHELL ["/bin/bash", "-c"]\nRUN pip install -r requirements.txt &> /dev/null\n',
+        'SHELL ["/bin/bash", "-o", "pipefail", "-c"]\nRUN pip install -r requirements.txt &>> /tmp/log\n',
+        "ARG REQ=other.txt\nENV REQ=requirements.txt\nRUN pip install -r $REQ\n",
+        # The RUN's last and-or list fails the build if a command in it fails, so its install runs in every build.
+        "RUN echo start; apt-get update && pip install -r requirements.txt\n",
+        "RUN set -eux; apt-get update && apt-get install -y gcc && pip install -r requirements.txt\n",
+        # An exit inside a subshell only leaves the subshell.
+        "RUN (exit 0); pip install -r requirements.txt\n",
+        # Archives and patches elsewhere, and copies of named files into /etc.
+        "RUN tar xzf /tmp/src.tgz -C /opt && pip install -r requirements.txt\n",
+        "RUN unzip /tmp/a.zip -d /opt/a\n" + _INSTALL,
+        "RUN git clone https://example.test/x /opt/x\n" + _INSTALL,
+        "RUN cp /tmp/hosts.conf /etc/\n" + _INSTALL,
+        "RUN mv /tmp/cfg /root/\n" + _INSTALL,
+        # The image's own Python, the image's venv, and a PATH that keeps the image's Python first.
+        "RUN /usr/local/bin/pip install -r requirements.txt\n",
+        "RUN python -m venv /opt/venv && /opt/venv/bin/pip install -r requirements.txt\n",
+        "RUN python -m venv /opt/venv\nENV PATH=/opt/venv/bin:$PATH\n" + _INSTALL,
+        "RUN python -m venv /opt/venv && . /opt/venv/bin/activate && pip install -r requirements.txt\n",
+        "ENV PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:$PATH\n" + _INSTALL,
+        "ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n" + _INSTALL,
+        'ENV PATH "$PATH:/root/go/bin"\n' + _INSTALL,  # the legacy form, quoted: the image's Python stays first
+        "ENV PATH=${PATH}:/opt/tool/bin\n" + _INSTALL,
+        "RUN export PATH=/opt/x/bin:$PATH\n" + _INSTALL,  # a RUN's own PATH ends with it
+        # Pip set-up that ends at the newest pip, and cache mounts elsewhere.
+        "RUN pip install -U 'pip>=24' setuptools==70.0\n" + _INSTALL,
+        "RUN --mount=type=cache,target=/root/.cache/pip pip install -r requirements.txt\n",
+        "RUN --mount=type=cache,target=.cache pip install -r requirements.txt\n",  # /app/.cache
+        "RUN --mount=type=tmpfs,target=/tmp pip install -r requirements.txt\n",
+    ],
+)
+def test_dockerfile_requirements_reads_review_cases(tmp_path, body):
+    lines, report = _inputs(tmp_path, body)
+    assert lines and report.warnings == []
+
+
+@pytest.mark.parametrize(
+    ("run", "pythons", "error"),
+    [
+        (
+            "python3.11 -m pip install -r requirements.txt",
+            ("3.13",),
+            "installs for Python 3.11, and this run checks 3.13",
+        ),
+        ("pip3.11 install -r requirements.txt", ("3.13",), "installs for Python 3.11"),
+        (
+            "python3.13 -m pip install -r requirements.txt",
+            ("3.13", "3.14"),
+            "installs for Python 3.13, and this run checks 3.13, 3.14",
+        ),
+        ("python3.13 -m pip install -r requirements.txt", None, "a Python that isn't known"),
+        (
+            "python3.11 -m venv /venv && /venv/bin/pip install -r requirements.txt",
+            ("3.13",),
+            "installs for Python 3.11",
+        ),
+        ("python3.13 -m pip install -r requirements.txt", ("3.13",), None),
+        ("pip3.13 install -r requirements.txt", ("3.13",), None),
+        ("python3.13 -m venv /venv && /venv/bin/python -m pip install -r requirements.txt", ("3.13",), None),
+    ],
+)
+def test_dockerfile_requirements_versioned_pythons_must_be_the_one_checked(tmp_path, run, pythons, error):
+    path = _context(tmp_path, f"FROM python:3.13\nWORKDIR /app\nCOPY requirements.txt .\nRUN {run}\n")
+    if error is None:
+        assert len(dockerfile_requirements(path, pythons=pythons)) == 1
+    else:
+        with pytest.raises(DockerfileError, match=error):
+            dockerfile_requirements(path, pythons=pythons)
+
+
+def test_dockerfile_requirements_reads_bin_dir_pythons_of_an_image_it_cant_read(tmp_path):
+    # With -p/-t for the image, /usr/bin/pip3 is as much the image's as `pip3`; an official image's is Debian's.
+    for image, read in (("ubuntu:24.04", True), ("python:3.12", False)):
+        path = _context(
+            tmp_path,
+            f"FROM {image}\nWORKDIR /app\nCOPY requirements.txt .\nRUN /usr/bin/pip3 install -r requirements.txt\n",
+        )
+        if read:
+            assert len(dockerfile_requirements(path, pythons=("3.12",))) == 1
+        else:
+            with pytest.raises(DockerfileError, match="doesn't know which Python /usr/bin/pip3"):
+                dockerfile_requirements(path, pythons=("3.12",))
+
+
+def test_dockerfile_requirements_notes_only_system_python_packages_before_the_install(tmp_path):
+    _, report = _inputs(tmp_path, "RUN apk add py3-yaml\n" + _INSTALL + "RUN apk add py3-flask\n")
+    assert report.system_python == [(4, "py3-yaml")]
+    _, report = _inputs(tmp_path, "RUN apk add py3-yaml && pip install -r requirements.txt && apk add py3-flask\n")
+    assert report.system_python == [(4, "py3-yaml")]
+
+
+def test_cli_dockerfile_inputs_warnings_cant_be_missed(tmp_path, capsys, fake_pypi, monkeypatch):
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    path = _context(
+        tmp_path, "FROM python:3.13\nWORKDIR /app\nCOPY requirements.txt .\n" + _INSTALL + "RUN ./post.sh\n"
+    )
+    argv = ["--dockerfile", str(path), "--dockerfile-inputs"]
+    # Text: no green tick; the headline says what the answer covers.
+    assert main(argv) == 0  # warnings don't change the exit code
+    out = capsys.readouterr().out
+    assert "✓" not in out
+    assert "! The 1 package wheelgap read has a wheel for 1 target; line 5 wasn't seen into." in out
+    # Markdown: the headline too.
+    assert main([*argv, "--markdown"]) == 0
+    out = capsys.readouterr().out
+    assert "### wheelgap: the 1 package wheelgap read has a wheel for 1 target; line 5 wasn't seen into" in out
+    assert "every package has a wheel" not in out
+    # --json: summary.complete.
+    assert main([*argv, "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["summary"]["complete"] is False
+    # Annotations, SARIF and JUnit.
+    sarif, junit = tmp_path / "out.sarif", tmp_path / "out.xml"
+    assert main([*argv, "--github-annotations", "--sarif", str(sarif), "--junit", str(junit)]) == 0
+    assert "::warning file=Dockerfile,line=5,title=wheelgap::this line runs `./post.sh`" in capsys.readouterr().out
+    [result] = json.loads(sarif.read_text(encoding="utf-8"))["runs"][0]["results"]
+    assert (result["ruleId"], result["level"]) == ("wheelgap/dockerfile-unseen", "warning")
+    assert result["locations"][0]["physicalLocation"]["region"] == {"startLine": 5}
+    xml = junit.read_text(encoding="utf-8")
+    assert '<property name="wheelgap.dockerfile-warning" value="' in xml
+    assert f"<system-out>wheelgap: warning: {path}:5: this line runs `./post.sh`" in xml
+    # With nothing unseen: complete, and the green tick.
+    path.write_text("FROM python:3.13\nWORKDIR /app\nCOPY requirements.txt .\n" + _INSTALL, encoding="utf-8")
+    assert main([*argv, "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["summary"]["complete"] is True
+    assert main(argv) == 0
+    assert "✓ The 1 package has a wheel" in capsys.readouterr().out
+
+
+# Second review (#657): writes over the image's Python or pip, installers named inside other programs' arguments,
+# and PATH values BuildKit expands.
+_PI = "RUN python -m pip install -r requirements.txt\n"
+
+
+@pytest.mark.parametrize(
+    ("body", "error"),
+    [
+        # A: a RUN that writes over the Python or pip a later install runs (case names from the review).
+        (
+            "RUN ln -sf /usr/bin/python3 /usr/local/bin/python\n" + _PI,
+            ":4: this line writes /usr/local/bin/python",
+        ),  # g15
+        (
+            "RUN update-alternatives --install /usr/local/bin/python python /usr/bin/python3 99\n" + _PI,  # g16
+            ":4: this line writes /usr/local/bin/python, which may replace the Python or pip",
+        ),
+        (
+            "RUN printf '#!/bin/sh\\nexec pip3 \"$@\"\\n' > /usr/local/bin/pip\n" + _INSTALL,
+            ":4: .*writes /usr/local/bin/pip",
+        ),
+        ("RUN cp /usr/bin/pip3 /usr/local/bin/pip\n" + _INSTALL, ":4: .*writes /usr/local/bin/pip"),  # p19
+        ("RUN echo x | tee /usr/local/bin/pip\n" + _INSTALL, ":4: .*writes /usr/local/bin/pip"),  # p20
+        ("RUN cd /usr/local/bin && ln -sf /usr/bin/pip3 pip\n" + _INSTALL, ":4: this line writes pip"),  # p17
+        (
+            "RUN sed -i s/x/y/ /usr/local/lib/python3.13/site-packages/pip/_internal/models/target_python.py\n"
+            + _INSTALL,
+            ":4: .*writes /usr/local/lib/python3.13/site-packages/pip",
+        ),  # p21
+        ("RUN echo /opt/deps > /usr/local/lib/python3.13/site-packages/deps.pth\n" + _INSTALL, ":4: .*deps.pth"),  # p23
+        (
+            "RUN python -m venv /venv && ln -sf /usr/bin/python3 /venv/bin/python\n"
+            "RUN /venv/bin/pip install -r requirements.txt\n",
+            ":4: .*writes /venv/bin/python",
+        ),  # p02
+        # C: an installer named in a passed-over program's arguments.
+        (
+            "RUN node -e \"require('child_process').execSync('pip install idna==3.10')\"\n" + _INSTALL,
+            ":4: .*names an installer in its arguments",
+        ),  # r1
+        ("RUN ruby -e 'system(\"pip install idna==3.10\")'\n" + _INSTALL, ":4: .*names an installer"),  # r2
+        (
+            "RUN echo x | sed 'e pip install idna==3.10'\n" + _INSTALL,
+            ":4: .*`sed e pip install idna==3.10`, which names an installer",
+        ),  # r3
+        ("RUN git -c alias.x='!pip install idna==3.10' x\n" + _INSTALL, ":4: .*names an installer"),  # r5
+        ("RUN npm exec -- python3 -m pip install idna\n" + _INSTALL, ":4: .*names an installer"),
+        # bash's `hash -p` makes `pip` run another file.
+        (
+            'SHELL ["/bin/bash", "-c"]\nRUN hash -p /usr/bin/pip3 pip && pip install -r requirements.txt\n',
+            ":5: .*hash -p",
+        ),  # p15
+    ],
+)
+def test_dockerfile_requirements_stops_on_second_review_cases(tmp_path, body, error):
+    with pytest.raises(DockerfileError, match=error):
+        _inputs(tmp_path, body)
+
+
+def test_dockerfile_requirements_stops_on_update_alternatives_over_the_python_checked(tmp_path):
+    # s1: with -p/-t for ubuntu:22.04, python3 is the image's 3.10, until update-alternatives makes it 3.11.
+    run = (
+        "RUN apt-get update && apt-get install -y python3.11 python3-pip && "
+        "update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1\n"
+    )
+    head = "FROM ubuntu:22.04\nWORKDIR /app\nCOPY requirements.txt .\n"
+    path = _context(tmp_path, head + run + "RUN python3 -m pip install -r requirements.txt\n")
+    with pytest.raises(DockerfileError, match=":4: this line writes /usr/bin/python3, which may replace"):
+        dockerfile_requirements(path, pythons=("3.10",))
+    path = _context(
+        tmp_path,
+        head + "RUN ln -sf /usr/bin/python3.11 /usr/bin/python3\nRUN python3 -m pip install -r requirements.txt\n",
+    )
+    with pytest.raises(DockerfileError, match=":4: this line writes /usr/bin/python3"):  # s2
+        dockerfile_requirements(path, pythons=("3.10",))
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # Writes elsewhere, and copies from the Python's folders, are still passed over.
+        "RUN ln -s /usr/local/bin/python3 /opt/python\n" + _INSTALL,
+        "RUN cp /usr/local/bin/pip /tmp/pip-backup\n" + _INSTALL,
+        "RUN echo x > /usr/local/bin/myscript && chmod +x /usr/local/bin/myscript\n" + _INSTALL,
+        "RUN node -e \"console.log('hi')\" && git -c core.x=1 status\n" + _INSTALL,
+        "RUN echo 'run pip install -r requirements.txt' > /tmp/README\n" + _INSTALL,
+        # BuildKit expands an ENV value with the values before it: the usual venv recipe reads.
+        'ENV VIRTUAL_ENV=/opt/venv\nRUN python -m venv $VIRTUAL_ENV\nENV PATH="$VIRTUAL_ENV/bin:$PATH"\n'
+        + _INSTALL,  # p01
+        "RUN python -m venv /venv\nENV PATH /venv/bin:$PATH\n" + _INSTALL,  # g19
+        # Read-only probes after a PATH change don't install, whichever Python they run.
+        "ENV PATH=/opt/tools/bin:$PATH\nRUN python --version && pip --version && pip list && python -m pip freeze\n",
+    ],
+)
+def test_dockerfile_requirements_reads_second_review_cases(tmp_path, body):
+    lines, report = _inputs(
+        tmp_path, body if "pip install" in body else body + "ENV PATH=/usr/local/bin:$PATH\n" + _INSTALL
+    )
+    assert lines and report.warnings == []
+
+
+def test_dockerfile_requirements_path_entry_with_an_unknown_value_is_shown_as_written(tmp_path):
+    with pytest.raises(DockerfileError, match=r"puts \$VIRTUAL_ENV/bin, a value wheelgap doesn't know, first"):
+        _inputs(tmp_path, 'ENV PATH="$VIRTUAL_ENV/bin:$PATH"\n' + _INSTALL)
+
+
+def test_dockerfile_requirements_reads_the_root_folder_of_an_official_python_image(tmp_path):
+    # No WORKDIR: BuildKit runs and copies in "/", since the python image sets no WorkingDir.
+    path = _context(tmp_path, "FROM python:3.13\nCOPY requirements.txt .\nRUN pip install -r requirements.txt\n")
+    assert [line for line, _ in dockerfile_requirements(path)] == [3]
+
+
+def test_dockerfile_requirements_names_the_command_after_nice(tmp_path):
+    with pytest.raises(DockerfileError, match=":4: this line runs `./x.sh`, a script"):  # g07
+        _inputs(tmp_path, "RUN nice -n 10 ./x.sh\n" + _INSTALL)
+
+
+def test_cli_dockerfile_inputs_unread_image_is_not_complete(tmp_path, capsys, fake_pypi):
+    path = _context(tmp_path, "FROM ubuntu:24.04\nWORKDIR /app\nCOPY requirements.txt .\n" + _INSTALL)
+    argv = ["--dockerfile", str(path), "--dockerfile-inputs", "-p", "3.12", "-t", "linux-x86_64"]
+    assert main([*argv, "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["summary"]["complete"] is False
+    assert main(argv) == 0
+    out = capsys.readouterr().out
+    assert "✓" not in out
+    assert "! The 1 package wheelgap read has a wheel for 1 target; the image wasn't read (-p and -t stand in" in out
+    assert main([*argv, "--markdown"]) == 0
+    assert (
+        "### wheelgap: the 1 package wheelgap read has a wheel for 1 target; the image wasn't read"
+        in capsys.readouterr().out
+    )
