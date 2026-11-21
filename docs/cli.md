@@ -66,6 +66,22 @@ unless `--dockerfile`, `[tool.wheelgap] targets` or uv's `required-environments`
 final stage, such as `FROM python:3.13-alpine`. `-p`, `-t`, `--glibc` and `--musl` still win. See
 [From a Dockerfile](targets.md#from-a-dockerfile).
 
+**After 0.13.0**, `-p` and `-t` together also stand in for an image wheelgap can't read: `FROM ubuntu:24.04`,
+`nvidia/cuda`, `node`, a python tag that names no version, or a `FROM` whose build argument has no value. In 0.13.0
+that is an error even with both flags. Nothing is taken from such an image, and a note that `--quiet` doesn't hide
+(also in `--json`, as [`dockerfile_notes`](output.md#json)) says what the Dockerfile then leaves unknown: which
+Python the image's `pip` installs for and which pip version it has, the image's glibc or musl version (pass
+`--glibc` or `--musl`; otherwise wheelgap's default is checked), the packages the image already has, the image's own
+pip settings (`ENV PIP_…`, a `pip.conf`, a constraints file) and any `ONBUILD` instructions it runs in your build
+(`python:3-onbuild` runs its own `pip install -r requirements.txt`). The note is also a quoted line under
+`--markdown`, a `::notice` under [`--github-annotations`](#github-annotations) and a `note` result in
+[`--sarif`](output.md#sarif). When the tag says Alpine or musl (`python:3-alpine`, `node:22-alpine`) and glibc
+targets (`-t linux-…`) are checked, a second note (kind `image-libc`) says so: pass `-t musl-…` if the image uses
+musl. Without both flags the image is still an error, and with `--dockerfile-inputs` it is the first error reported.
+A `FROM` that Docker itself rejects stays an error, and so does `FROM scratch` (an empty image has no Python but one
+a `COPY` brings), and, with `--dockerfile-inputs`, a `FROM ${NAME}` wheelgap can't expand in a Dockerfile with named
+stages before it, since it may name one of them: pass its value with [`--build-arg`](#build-arg).
+
 ### `--dockerfile-inputs` {#dockerfile-inputs}
 
 `--dockerfile-inputs` (with `--dockerfile`, and no `INPUT`): check the requirements files the Dockerfile's final stage

@@ -470,6 +470,11 @@ name; `pyproject`: the root's `pyproject.toml`; `requirements`: the root's only 
 `scripts/requirements.txt`, where every other input has its file name only) and `empty`, the files that come first in the search but had nothing to
 check, each with its `file` and `why` (`[]` in the usual case). The key is absent when no input was a directory. See
 [Which file is read](inputs.md#which-file-is-read).
+`dockerfile_notes` (after 0.13.0) lists what a `--dockerfile` answer leaves out, one object each: the `dockerfile`
+path as given, the `line` it is about (or `null`), a `kind` to match on and the `message` the note on stderr has.
+The kinds so far: `image-not-read`, `-p` and `-t` stood in for an [image wheelgap can't read](cli.md#dockerfile);
+`image-libc`, that image's tag says Alpine or musl and glibc targets were checked. The key is absent when there is
+nothing to say.
 
 `results`, `rejected` and `via` are all keyed by target label: just the platform (`"linux-x86_64"`) when one Python is
 checked, or Python and platform (`"3.13 linux-x86_64"`) with several. The top-level `targets` list gives each target's
@@ -607,6 +612,9 @@ another SARIF viewer), alongside whatever output mode you use. It has two rules,
   current directory), as for [`--github-annotations`](cli.md#github-annotations), or the file's first line when
   wheelgap can't tell the line (`pyproject.toml`, say). A package named on the command line, or read from a file
   outside the repository, has no location: its gap still fails the job, but code scanning doesn't show it.
+- **After 0.13.0**, with `--dockerfile`, a note that the final image wasn't read ([`dockerfile_notes`](#json) of kind
+  `image-not-read` or `image-libc`) is a `note` result of a third rule, `wheelgap/dockerfile-note`, at the `FROM`
+  line. The rule is listed only in a run that has such a result.
 - `partialFingerprints` key a result by file, package and target, not version, so code scanning keeps one alert open
   across lockfile bumps until the gap goes away. A package that one file locks at several versions gets an alert per
   version.

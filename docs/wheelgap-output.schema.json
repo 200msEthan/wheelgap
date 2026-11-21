@@ -34,6 +34,28 @@
                 }
             }
         },
+        "dockerfile_notes": {
+            "type": "array",
+            "description": "With --dockerfile, what the answer leaves out: absent when there is nothing to say.",
+            "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["dockerfile", "line", "kind", "message"],
+                "properties": {
+                    "dockerfile": {"type": "string", "description": "The --dockerfile path as given."},
+                    "line": {
+                        "type": ["integer", "null"],
+                        "minimum": 1,
+                        "description": "The Dockerfile line the note is about, from 1, or null."
+                    },
+                    "kind": {
+                        "type": "string",
+                        "description": "What was left out. image-not-read: -p and -t stood in for the image. image-libc: that image's tag says Alpine or musl, and glibc targets were checked."
+                    },
+                    "message": {"type": "string", "description": "The note as printed on stderr."}
+                }
+            }
+        },
         "directory_inputs": {
             "type": "array",
             "description": "For each input that was a directory (after 0.13.0), the file wheelgap read from it and why. Absent when no input was a directory.",
