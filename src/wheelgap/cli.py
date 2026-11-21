@@ -1920,6 +1920,7 @@ def _main(argv: list[str], project: Path | None = None) -> int:
         config_inputs = args.inputs
     docker_includes: dict[tuple[int, Path], tuple[Path, ...]] = {}
     docker_constraints: dict[Path, tuple[Path, ...]] = {}
+    uv_installs: set[tuple[int, Path]] = set()
     try:
         if args.dockerfile_inputs:
             context = Path(args.dockerfile_context) if args.dockerfile_context else None
@@ -1930,6 +1931,7 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 includes=docker_includes,
                 constraints=docker_constraints,
                 dependencies=args.deps,
+                uv_installs=uv_installs,
             )
             args.inputs = [str(requirements) for _, requirements in installs]
         if args.clear_cache:
@@ -1969,8 +1971,9 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                         files += f", -c {constraint}"
                         if nested := docker_includes[install_line, constraint]:
                             files += f" (which includes {', '.join(str(file) for file in nested)})"
+                    installer = "uv pip" if (install_line, requirements) in uv_installs else "pip"
                     print(
-                        f"wheelgap: note: {args.dockerfile}:{install_line}: RUN pip install -r reads {files}",
+                        f"wheelgap: note: {args.dockerfile}:{install_line}: RUN {installer} install -r reads {files}",
                         file=sys.stderr,
                     )
                 for name, value in image.build_args:
@@ -2398,6 +2401,14 @@ def _main(argv: list[str], project: Path | None = None) -> int:
         for source, needed in zip(sources, needed_by_source, strict=True):
             if source.uv_packages is not None:
                 restore_uv_python_files(needed, pythons)
+    # --dockerfile-inputs: a requirements file that `RUN uv pip install` installs follows uv's rules, not pip's, as
+    # a uv.lock checked with --online does just above: uv checks only the lower bound of a file's Requires-Python,
+    # so it installs a pin pip refuses (uv 0.13.1 installs sktime==0.20.0, Requires-Python <3.12,>=3.8, on Python
+    # 3.13; pip finds no matching distribution). Every requirement in such a file is pinned (dockerfile_requirements).
+    uv_files = {requirements for line, requirements in installs if (line, requirements) in uv_installs}
+    for source, needed in zip(sources, needed_by_source, strict=True):
+        if source.path in uv_files:
+            restore_uv_python_files(needed, pythons)
     skipped = [p for p in packages if p.skip]
     rows = [r for r in check(sources, targets) if r.needed]
     if pyodide_lock:

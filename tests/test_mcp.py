@@ -830,6 +830,13 @@ def test_check_lockfile_offline_false_note_about_pip_names_no_flag(fake_pypi, tm
             False,
             "Dockerfile:4: uv pip install --group: the inputs argument only reads -r FILE",
         ),
+        (
+            "Dockerfile:4: uv pip install --offline: --dockerfile-inputs only reads --system, -r FILE, -c FILE, "
+            "--no-cache, --no-cache-dir, --upgrade (-U) and --quiet (-q) for uv",
+            False,
+            "Dockerfile:4: uv pip install --offline: the inputs argument only reads --system, -r FILE, -c FILE, "
+            "--no-cache, --no-cache-dir, --upgrade (-U) and --quiet (-q) for uv",
+        ),
         # A command in backticks is one to run as written.
         (
             "no lockfile found in /srv/app (looked for uv.lock, pylock.toml, poetry.lock, pdm.lock, Pipfile.lock, "

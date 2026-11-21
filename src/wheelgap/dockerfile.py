@@ -973,6 +973,8 @@ def read_dockerfile(path: Path, build_args: Mapping[str, str] | None = None) -> 
 _PLAIN_ARGS_RE = re.compile(r"[A-Za-z0-9_./:=, \t-]*", re.ASCII)  # no quotes, $, escapes, globs, # or shell operators
 _PIP_RE = re.compile(r"pip(?:3(?:\.\d+)?)?", re.ASCII)
 _PYTHON_RE = re.compile(r"python(?:3(?:\.\d+)?)?", re.ASCII)
+_UV_IMAGE_RE = re.compile(r"ghcr\.io/astral-sh/uv(?::[\w][\w.-]*)?(?:@sha256:[0-9a-f]{64})?", re.ASCII)
+_UV_CONFIG_NAMES = ("uv.toml", "pyproject.toml")
 _COPY_FLAG_RE = re.compile(r"--(?:chown=[\w.:-]+|chmod=[0-7]{3,4}|link)", re.ASCII)
 _PLAIN = "no quotes, variables, escapes, globs, comments or shell operators"
 # RUN lines other than `pip install -r FILE` that are read as not changing what pip installs: system package managers
@@ -992,6 +994,7 @@ class _Copy:
     dest: str  # absolute and normalised
     into: bool  # the sources land inside dest: a / at its end, several sources, a folder, or dest a known folder
     error: str | None = None  # why wheelgap can't tell what this instruction puts in the image
+    uv_binaries: tuple[str, ...] = ()
 
 
 def _add_dir(dirs: set[str], folder: str) -> None:
@@ -1012,6 +1015,19 @@ def _read_copy(
     def unread(error: str) -> _Copy:
         return _Copy(number, (), "", False, error)
 
+    if args.startswith("--from=") and len(args.split()) >= 2:
+        source, *names, dest = args.split()
+        if (
+            _UV_IMAGE_RE.fullmatch(source.removeprefix("--from="))
+            and names in (["/uv"], ["/uv", "/uvx"])
+            and dest.endswith("/")
+            and _PLAIN_ARGS_RE.fullmatch(dest)
+            and (dest.startswith("/") or workdir is not None)
+        ):
+            target = posixpath.normpath(posixpath.join(workdir or "/", dest))
+            _add_dir(dirs, target)
+            return _Copy(number, (), target, True, uv_binaries=tuple(name[1:] for name in names))
+        return unread(f"COPY {source} isn't read by --dockerfile-inputs except when copying /uv and optional /uvx")
     if args.lstrip().startswith("[") or not _PLAIN_ARGS_RE.fullmatch(args):
         return unread(f"only a plain `COPY SRC... DEST` is read by --dockerfile-inputs ({_PLAIN}, no JSON form)")
     words = args.split()
@@ -1057,6 +1073,8 @@ def _read_copy(
 
 def _copied_file(copy: _Copy, target: str, context: Path, ignore_rules: tuple[dockerignore.Rule, ...]) -> Path | None:
     """The file in the build context `copy` puts at `target` in the image, or None if it puts none there."""
+    if any(target == posixpath.join(copy.dest, binary) for binary in copy.uv_binaries):
+        raise DockerfileError(f"line {copy.line}: {target} is a uv binary from another image, not a requirements file")
     root = context.resolve()
     for rel, host, is_dir in reversed(copy.sources):  # a later source overwrites an earlier one
         if not is_dir:
@@ -1092,23 +1110,23 @@ def _copied_file(copy: _Copy, target: str, context: Path, ignore_rules: tuple[do
     return None
 
 
-def _copies_pip_config(copy: _Copy) -> bool:
-    """Whether `copy` may put a file named pip.conf or pip.ini anywhere in the image. pip reads one from /etc,
-    /etc/xdg/pip, sys.prefix (/usr/local) and the home of whichever user runs it, so its name is what counts."""
+def _copies_config(copy: _Copy, names: tuple[str, ...]) -> bool:
+    """Whether COPY can put an installer configuration file anywhere in the image."""
     for rel, host, is_dir in copy.sources:
         if is_dir:
             for _, dirnames, filenames in os.walk(host):
-                if any(name.lower() in _PIP_CONFIG_NAMES for name in (*dirnames, *filenames)):
+                if any(name.lower() in names for name in (*dirnames, *filenames)):
                     return True
         # Not knowing whether dest is a folder in the image, either name may be the one the file gets.
-        elif any(posixpath.basename(name).lower() in _PIP_CONFIG_NAMES for name in (rel, copy.dest)):
+        elif any(posixpath.basename(name).lower() in names for name in (rel, copy.dest)):
             return True
-    return (copy.dest + "/").startswith(_PIP_CONFIG)
+    return names == _PIP_CONFIG_NAMES and (copy.dest + "/").startswith(_PIP_CONFIG)
 
 
-def _requirement_includes(host: Path, number: int) -> list[str]:
-    """The files a requirements or constraints file includes with -r or -c, as written, found on the same lines and
-    with the same reader (`_line_include`) as `_read_requirements` in sources.py, which reads the file afterwards.
+def _requirement_includes(host: Path, number: int) -> list[tuple[bool, str]]:
+    """The files a requirements or constraints file includes with -r or -c, as (whether it's a -c, the path as
+    written), found on the same lines and with the same reader (`_line_include`) as `_read_requirements` in
+    sources.py, which reads the file afterwards.
     An include wheelgap can't follow from the image back to the build context is a DockerfileError: a URL, a
     variable, an absolute path (pip reads it in the image; the reader would read that path on this machine), an
     abbreviated option, or one on a line with an editable."""
@@ -1145,7 +1163,7 @@ def _requirement_includes(host: Path, number: int) -> list[str]:
             raise DockerfileError(f"line {number}: {host.name} has an include with .. after a folder name: {name}")
         if any(token.startswith(("-r=", "-c=")) for token in tokens):
             raise DockerfileError(f"line {number}: {host.name} has an unreadable -r or -c: {line}")
-        includes.append(name)
+        includes.append((include[0], name))
     return includes
 
 
@@ -1180,16 +1198,23 @@ def _check_includes(
     context: Path,
     number: int,
     ignore_rules: tuple[dockerignore.Rule, ...],
+    *,
+    uv: bool = False,
+    constraints_file: bool = False,
 ) -> tuple[Path, ...]:
     """The files that `host` (at `target` in the image) includes with -r or -c, at every depth, each checked to be the
     file the image has where pip looks for it. pip resolves an include beside the including file in the image;
     `_read_requirements` resolves it beside the file in the build context. So each include is followed in the image
     (`_find_copied_file`) and must come back to that same file in the context: one that isn't copied, or where a
     COPY puts another file, or that the ignore rules leave out of the build context, is a DockerfileError, and nothing
-    the image doesn't have is read."""
+    the image doesn't have is read.
+
+    For `uv` (a `uv pip install` line; `constraints_file` says `host` is its `-c FILE`), a -r inside a constraints
+    file is a DockerfileError too: pip installs what that file names, and the requirements reader follows pip, but uv
+    only constrains with it (uv 0.13.1: `-c c.txt` where c.txt has `-r more.txt` installs nothing from more.txt)."""
     found: dict[Path, None] = {}
     active: set[Path] = set()
-    checked: set[tuple[Path, str]] = set()
+    checked: set[tuple[Path, str, bool]] = set()
 
     def no_symlink(file: Path) -> None:
         # A symlinked folder in a copied folder stays a link in the image, where it may point somewhere else: it isn't
@@ -1201,14 +1226,19 @@ def _check_includes(
                 "for a file with a -r or -c, or a file one names"
             )
 
-    def visit(current: Path, image: str) -> None:
-        if (current, image) in checked:
+    def visit(current: Path, image: str, uv_constraints: bool) -> None:
+        if (current, image, uv_constraints) in checked:
             return
         active.add(current)
         includes = _requirement_includes(current, number)
         if includes:
             no_symlink(current)
-        for include in includes:
+        for constraint, include in includes:
+            if uv_constraints and not constraint:
+                raise DockerfileError(
+                    f"line {number}: {current.name} is read as constraints and has -r {include}: pip installs what "
+                    "that file names and uv only constrains with it, which --dockerfile-inputs doesn't read for uv"
+                )
             image_path = posixpath.normpath(posixpath.join(posixpath.dirname(image), include))
             copied = _find_copied_file(copies, image_path, context, number, ignore_rules)
             no_symlink(copied)
@@ -1218,11 +1248,11 @@ def _check_includes(
             if copied in active:
                 raise DockerfileError(f"line {number}: requirements include cycle through {include}")
             found[copied] = None
-            visit(copied, image_path)
+            visit(copied, image_path, uv and (uv_constraints or constraint))
         active.remove(current)
-        checked.add((current, image))
+        checked.add((current, image, uv_constraints))
 
-    visit(host, target)
+    visit(host, target, uv and constraints_file)
     return tuple(found)
 
 
@@ -1261,11 +1291,51 @@ _PIP_FLAGS_READ = (
 )
 
 
-def _pip_install_files(number: int, args: str) -> tuple[list[str], list[str], bool]:
-    """(the -r FILEs, the -c FILEs, whether --prefer-binary is given) of a RUN that is exactly
-    `pip install -r FILE...` (or `python -m pip ...`) with flags that don't change what pip picks."""
+# `uv pip install` flags that are read. uv has its own flags: of pip's harmless ones above it takes --upgrade (-U) and
+# --quiet (-q) with the same meaning, it has no --no-input, --root-user-action or --prefer-binary, and it takes
+# --disable-pip-version-check only to warn that it does nothing (`uv pip install --help`, uv 0.13.1).
+_UV_HARMLESS_FLAGS = ("--no-cache", "--no-cache-dir", "--upgrade", "-U", "-q", "--quiet")
+_UV_FLAGS_READ = "--system, -r FILE, -c FILE, --no-cache, --no-cache-dir, --upgrade (-U) and --quiet (-q)"
+_UV_REQUIREMENTS_SUFFIXES = (".txt", ".in")
+
+
+def _refuse_uv_option_lines(file: Path, number: int) -> None:
+    """A file `uv pip install` reads may only hold requirements and plain `-r FILE` / `-c FILE` lines. The reader
+    follows pip for every other option line, and uv differs: with --extra-index-url uv takes the first index that
+    has the package where pip takes the best file of them all, and it keeps --no-binary and --only-binary as two
+    sets with no `:none:` (uv 0.13.9: `--no-binary :all:` then `--no-binary :none:` builds from source; pip takes
+    the wheel). The include itself must be spelled as both read it: uv has no `-rFILE`, pip's optparse reads
+    `-r=FILE` as a file named `=FILE`, and uv doesn't take quotes or escapes out of a line as pip's shlex does.
+    A requirement with its own options (`six==1.16.0 --hash=...`) isn't an option line."""
+    for raw in _join_continued_lines(file.read_text(encoding="utf-8-sig")):
+        line = _COMMENT_RE.split(raw, 1)[0].strip()
+        if not line.startswith("-"):
+            continue
+        try:
+            tokens = shlex.split(line)  # as _requirement_includes, which has already split every such line
+        except ValueError:
+            tokens = []
+        option = re.sub(r"[^A-Za-z-].*", "", line.split()[0])  # the option's name: no value, so never a URL
+        if tokens == line.split() and (
+            (len(tokens) == 2 and tokens[0] in ("-r", "-c", "--requirement", "--constraint"))
+            or (len(tokens) == 1 and "=" in tokens[0] and option in ("--requirement", "--constraint"))
+        ):
+            continue
+        if not option.startswith("--"):
+            option = option[:2]  # `-ihttps://user:secret@host/simple`: never echo the URL
+        raise DockerfileError(
+            f"line {number}: {file.name} has a {option} line, and uv reads a requirements file's options by its own "
+            "rules: --dockerfile-inputs only reads requirements and -r FILE / -c FILE lines in a file uv installs"
+        )
+
+
+def _pip_install_files(number: int, args: str) -> tuple[list[str], list[str], bool, bool]:
+    """(the -r FILEs, the -c FILEs, whether --prefer-binary is given, whether uv installs them) of a RUN that is
+    exactly `pip install -r FILE...` (or `python -m pip ...`, or `uv pip install --system -r FILE...`) with flags
+    that don't change what the installer picks."""
     unread = (
-        "only `RUN pip install -r FILE` and system package commands (apt-get, apk, dnf...) are read by "
+        "only `RUN pip install -r FILE`, `RUN uv pip install --system -r FILE` and "
+        "system package commands (apt-get, apk, dnf...) are read by "
         "--dockerfile-inputs, and this RUN may change what pip installs"
     )
     if args.startswith("--"):
@@ -1275,7 +1345,10 @@ def _pip_install_files(number: int, args: str) -> tuple[list[str], list[str], bo
     if not _PLAIN_ARGS_RE.fullmatch(args):
         raise DockerfileError(f"line {number}: {unread} ({_PLAIN})")
     words = args.split()
-    if words[:1] and _PIP_RE.fullmatch(words[0]):
+    uv = words[:2] == ["uv", "pip"]
+    if uv:
+        rest = words[2:]
+    elif words[:1] and _PIP_RE.fullmatch(words[0]):
         rest = words[1:]
     elif len(words) >= 3 and _PYTHON_RE.fullmatch(words[0]) and words[1:3] == ["-m", "pip"]:
         rest = words[3:]
@@ -1286,9 +1359,29 @@ def _pip_install_files(number: int, args: str) -> tuple[list[str], list[str], bo
     files: list[str] = []
     constraints: list[str] = []
     prefer_binary = False
+    system = False
     i = 1
     while i < len(rest):
-        if rest[i] in ("-r", "--requirement") and i + 1 < len(rest) and not rest[i + 1].startswith("-"):
+        if uv:
+            # uv's own flags, first: a pip flag is read on a uv line only where uv has it with the same meaning.
+            # uv spells the two file options --requirements and --constraints, and takes pip's spellings too.
+            has_file = i + 1 < len(rest) and not rest[i + 1].startswith("-")
+            if rest[i] in ("-r", "--requirement", "--requirements") and has_file:
+                files.append(rest[i + 1])
+                i += 2
+            elif rest[i] in ("-c", "--constraint", "--constraints") and has_file:
+                constraints.append(rest[i + 1])
+                i += 2
+            elif rest[i] == "--system":
+                system = True
+                i += 1
+            elif rest[i] in _UV_HARMLESS_FLAGS:
+                i += 1
+            else:
+                raise DockerfileError(
+                    f"line {number}: uv pip install {rest[i]}: --dockerfile-inputs only reads {_UV_FLAGS_READ} for uv"
+                )
+        elif rest[i] in ("-r", "--requirement") and i + 1 < len(rest) and not rest[i + 1].startswith("-"):
             files.append(rest[i + 1])
             i += 2
         elif rest[i] in ("-c", "--constraint") and i + 1 < len(rest) and not rest[i + 1].startswith("-"):
@@ -1309,7 +1402,20 @@ def _pip_install_files(number: int, args: str) -> tuple[list[str], list[str], bo
             )
     if not files:
         raise DockerfileError(f"line {number}: {unread}")
-    return files, constraints, prefer_binary
+    if uv and not system:
+        raise DockerfileError(f"line {number}: uv pip install needs --system for --dockerfile-inputs")
+    # uv picks the format of `-r FILE` by its name: pylock.toml is a lock, a .py file is a script with inline
+    # metadata, and pyproject.toml, setup.py, setup.cfg and extensionless files are read in other ways again. A .txt
+    # or .in file is a requirements file to uv and to wheelgap alike. The same names are asked of a `-c FILE`.
+    # https://github.com/astral-sh/uv/blob/0.13.1/crates/uv-requirements/src/sources.rs (from_local_requirements_file)
+    if uv:
+        for option, named in (("-r", files), ("-c", constraints)):
+            if other := next((file for file in named if not file.endswith(_UV_REQUIREMENTS_SUFFIXES)), None):
+                raise DockerfileError(
+                    f"line {number}: uv pip install {option} {other}: uv reads a file by its name (a lock, a script, "
+                    "a project), and --dockerfile-inputs only reads requirements files named *.txt or *.in for uv"
+                )
+    return files, constraints, prefer_binary, uv
 
 
 def dockerfile_requirements(
@@ -1320,6 +1426,7 @@ def dockerfile_requirements(
     includes: dict[tuple[int, Path], tuple[Path, ...]] | None = None,
     constraints: dict[Path, tuple[Path, ...]] | None = None,
     dependencies: bool = False,
+    uv_installs: set[tuple[int, Path]] | None = None,
 ) -> list[tuple[int, Path]]:
     """(line, requirements file) for each `RUN pip install -r FILE` in the Dockerfile's final stage.
 
@@ -1337,6 +1444,13 @@ def dockerfile_requirements(
     inside a `-r FILE` or a `-c FILE` is followed only when a COPY puts that same file where pip looks for it in the
     image (_check_includes); `includes`, if given, is filled with the files each (line, FILE) includes, for the
     requirements files and the constraints files alike.
+
+    `RUN uv pip install --system -r FILE` is read too (with -c FILE and the flags in _UV_FLAGS_READ, and the
+    documented `COPY --from=ghcr.io/astral-sh/uv /uv /uvx DEST/`), through the same lookup and checks. `uv_installs`
+    must be given for it, and collects the (line, file) pairs uv installs: the caller checks those by uv's rules, not
+    pip's. Because wheelgap picks a release for a range as pip does, a uv line is read only when every requirement is
+    pinned with == (as for --prefer-binary) and `dependencies` is false; a copied uv.toml or pyproject.toml, a file
+    not named *.txt or *.in, and a -r inside a constraints file (which uv reads as constraints) are errors as well.
     """
     try:
         text = path.read_bytes().decode("utf-8-sig")
@@ -1356,6 +1470,7 @@ def dockerfile_requirements(
             includes=includes,
             constraints=constraints,
             dependencies=dependencies,
+            uv_installs=uv_installs,
         )
     except DockerfileError as e:
         number, _, message = str(e).removeprefix("line ").partition(": ")
@@ -1374,6 +1489,7 @@ def _dockerfile_requirements(
     includes: dict[tuple[int, Path], tuple[Path, ...]] | None = None,
     constraints: dict[Path, tuple[Path, ...]] | None = None,
     dependencies: bool = False,
+    uv_installs: set[tuple[int, Path]] | None = None,
 ) -> list[tuple[int, Path]]:
     df_dir = dockerfile_dir if dockerfile_dir is not None else context
     try:
@@ -1416,9 +1532,11 @@ def _dockerfile_requirements(
     copies: list[_Copy] = []
     found: dict[Path, int] = {}
     used_constraints: dict[Path, tuple[Path, ...]] = {}
+    installed_by_uv: dict[Path, bool] = {}
 
-    def copied_requirements(file: str, option: str) -> Path:
-        """The file in the build context that `-r FILE` or `-c FILE` on the RUN at `number` reads in the image."""
+    def copied_requirements(file: str, option: str, uv: bool) -> Path:
+        """The file in the build context that `-r FILE` or `-c FILE` on the RUN at `number` reads in the image, for
+        pip or (`uv`) for uv pip."""
         if file.startswith("/"):
             target = posixpath.normpath(file)
         elif workdir is None:
@@ -1431,7 +1549,17 @@ def _dockerfile_requirements(
         host = _find_copied_file(copies, target, context, number, ignore_rules)
         # A constraints file's includes are verified as a requirements file's are: a -r inside it is read as
         # requirements (pip's rule), so those packages are installed, and a -c inside it constrains them all.
-        nested = _check_includes(host, target, copies, context, number, ignore_rules)
+        nested = _check_includes(
+            host, target, copies, context, number, ignore_rules, uv=uv, constraints_file=option == "-c"
+        )
+        if uv and (other := next((file for file in nested if file.suffix not in _UV_REQUIREMENTS_SUFFIXES), None)):
+            raise DockerfileError(
+                f"line {number}: {host.name} includes {other.name}, and --dockerfile-inputs only reads requirements "
+                "files named *.txt or *.in for uv"
+            )
+        if uv:
+            for read in (host, *nested):
+                _refuse_uv_option_lines(read, number)
         if includes is not None:
             includes[number, host] = nested
         return host
@@ -1450,7 +1578,7 @@ def _dockerfile_requirements(
                 _add_dir(dirs, workdir)
         elif keyword == "COPY":
             copies.append(copy := _read_copy(number, args, workdir, dirs, context, context_label, ignore_rules))
-            if _copies_pip_config(copy):
+            if _copies_config(copy, _PIP_CONFIG_NAMES):
                 run_error = f"line {number}: a pip config file may change what pip installs"
         elif keyword == "ADD":
             copies.append(_Copy(number, (), "", False, "ADD isn't read by --dockerfile-inputs, use COPY"))
@@ -1459,22 +1587,44 @@ def _dockerfile_requirements(
         elif keyword in ("ENV", "ARG") and re.search(r"(?<![A-Za-z0-9_])(?:PIP|UV)_", args):
             run_error = f"line {number}: an {keyword} setting PIP_ or UV_ variables changes what pip installs"
         elif keyword == "RUN" and not _system_command(args):
-            files, constraint_files, prefer_binary = _pip_install_files(number, args)
+            files, constraint_files, prefer_binary, uv = _pip_install_files(number, args)
             if run_error:
                 raise DockerfileError(run_error)
-            constraint_paths = tuple(copied_requirements(file, "-c") for file in constraint_files)
+            if uv and (config := next((copy for copy in copies if _copies_config(copy, _UV_CONFIG_NAMES)), None)):
+                raise DockerfileError(
+                    f"line {config.line}: this COPY puts a uv.toml or pyproject.toml in the image, and uv reads "
+                    "settings from them: copy the requirements file alone and run uv pip install before this COPY"
+                )
+            if uv and dependencies:
+                # A dependency is a range, resolved here by pip's rules (see the pins asked for below).
+                raise DockerfileError(
+                    f"line {number}: uv pip install isn't read with --deps: wheelgap follows dependencies as pip "
+                    "resolves them, and uv can pick other versions"
+                )
+            constraint_paths = tuple(copied_requirements(file, "-c", uv) for file in constraint_files)
             if constraint_paths and constraints is None:  # never read the requirements without their constraints
                 raise DockerfileError(f"line {number}: pip install -c FILE isn't read here")
             for file in files:
-                host = copied_requirements(file, "-r")
+                host = copied_requirements(file, "-r", uv)
                 # Read as load_inputs will read it: with the line's -c files, and through every include, so a
                 # requirement in an included file (or in a -r inside a constraints file) counts, and a requirement
                 # that only a constraint pins with == counts as pinned.
                 unpinned = (
                     [p for p in parse_requirements(host, constraint_paths).packages if not p.version]
-                    if prefer_binary and not dependencies
+                    if (prefer_binary or uv) and not dependencies
                     else []
                 )
+                if uv and unpinned:
+                    where = host.name
+                    if unpinned[0].origin != host.name:
+                        where = f"{unpinned[0].origin} (read with {host.name})"
+                    # wheelgap picks a release for a range as pip does, and pip skips releases whose Requires-Python
+                    # upper bound leaves the image's Python out, which uv takes: only a pin gives both the same one.
+                    raise DockerfileError(
+                        f"line {number}: uv pip install: {unpinned[0].name} in {where} isn't pinned with ==, and uv "
+                        "and pip can pick different versions for a range: pin it (in the file, or in a constraints "
+                        "file)"
+                    )
                 if prefer_binary and (dependencies or unpinned):
                     where = host.name
                     if unpinned and unpinned[0].origin != host.name:
@@ -1491,6 +1641,16 @@ def _dockerfile_requirements(
                         f"line {number}: {host.name} is installed again with other -c files than on line "
                         f"{found[host]}, which --dockerfile-inputs doesn't read"
                     )
+                if host in found and installed_by_uv[host] != uv:
+                    raise DockerfileError(
+                        f"line {number}: {host.name} is installed by pip on one line and by uv on another (line "
+                        f"{found[host]}), which --dockerfile-inputs doesn't read"
+                    )
+                if uv:
+                    if uv_installs is None:  # never check a file uv installs by pip's rules
+                        raise DockerfileError(f"line {number}: uv pip install -r FILE isn't read here")
+                    uv_installs.add((number, host))
+                installed_by_uv[host] = uv
                 used_constraints[host] = constraint_paths
                 found.setdefault(host, number)
             # An unread COPY or ADD before the one that copies FILE may still put a pip config file in the image.

@@ -99,9 +99,9 @@ that folder too. Only a strict subset is read:
   error.
 
 Anything else in the final stage is an error naming its line, since it may change what pip installs or what `FILE`
-holds: any other `RUN` (`&&` with other commands, redirects, variables, `--mount`, a heredoc, `uv pip`), `ADD`,
-`COPY --from`, globs, `SHELL`, an `ENV` or `ARG` setting `PIP_` or `UV_` variables, a COPY that puts a file named
-`pip.conf` or `pip.ini` anywhere in the image, a `# syntax=` frontend other than
+holds: any other `RUN` (`&&` with other commands, redirects, variables, `--mount`, a heredoc), `ADD`, `COPY --from`
+(but for the one that brings uv, below), globs, `SHELL`, an `ENV` or `ARG` setting `PIP_` or `UV_` variables, a COPY
+that puts a file named `pip.conf` or `pip.ini` anywhere in the image, a `# syntax=` frontend other than
 `docker/dockerfile` (one pinned by digest, `docker/dockerfile:1@sha256:…`, is read when the Dockerfile has no
 heredoc). Without this flag, `--dockerfile` reads only the image.
 
@@ -115,6 +115,25 @@ the build context; the note on stderr then names every file read
 An include that no `COPY` puts there (pip would stop the build), one where a `COPY` puts a different file, a URL, a
 `${VAR}`, an absolute path, an abbreviated option (`--req`), an include on a line with an editable, or a symlink
 anywhere in the chain is still an error naming the `RUN` line.
+
+`RUN uv pip install --system -r FILE` is read too (**after 0.13.0**; 0.13.0 refuses it), with the
+`COPY --from=ghcr.io/astral-sh/uv[:TAG] /uv /uvx DEST/` that puts uv in the image (`/uvx` is optional). `FILE` is
+found, and its includes are verified, as for pip. `--system` is required, since without it uv installs into a virtual
+environment; `-c FILE` (or `--constraints FILE`), `--no-cache`, `--no-cache-dir`, `--upgrade` / `-U` and `-q` /
+`--quiet` are read, and any other flag is an error, pip's own among them (`--no-input`, `--disable-pip-version-check`,
+`--root-user-action`, `--prefer-binary`). The answer follows uv, not pip: uv checks only the lower bound of a
+release's `Requires-Python`, so a pin that pip refuses for an upper bound is checked as uv installs it, and the report
+says which packages that changes (`pip_refuses` in `--json`). For a range the two can pick different versions, and
+wheelgap picks as pip does, so under uv every requirement must be pinned with `==` (in `FILE`, in a file it includes,
+or by a constraints file) and `--deps` can't be used: an unpinned requirement is an error naming the `RUN` line, the
+requirement and its file. These are errors as well: a file not named `*.txt` or `*.in` (uv reads other names as
+locks, scripts or projects), an option line other than a plain `-r FILE` or `-c FILE` in any file the line reads
+(`--extra-index-url`, `--index-url`, `--no-binary`, `--only-binary`, `--pre`, `-e`: uv reads these by its own rules,
+and with a second index it takes the first one that has the package, where pip takes the best file of them all; a
+requirement with its own `--hash` is fine), a `-r` inside a constraints file (pip installs what it names, uv only
+constrains with it), a `uv.toml` or `pyproject.toml` copied into the image before the uv line (uv reads settings
+from them: copy the requirements file alone and run `uv pip install` before the `COPY` that brings them), a file
+that pip installs on one line and uv on another, and every other `uv` command (`uv sync`, `uv add`, `uv pip sync`).
 
 A `.dockerignore` is read as BuildKit reads it (**after 0.13.0**; 0.13.0 refuses any project that has one):
 `<Dockerfile name>.dockerignore` beside the Dockerfile if there is one, otherwise `.dockerignore` at the root of the
