@@ -191,6 +191,32 @@ Default selections can go in [`[tool.wheelgap]`](configuration.md#extras) as `ex
 **Default targets:** wheelgap reads `[tool.uv] required-environments` from the project's `pyproject.toml` as default
 targets; see [Targets](targets.md#how-targets-are-chosen).
 
+**A lock limited by `[tool.uv] environments`** (after 0.13.0): with
+[`environments`](https://docs.astral.sh/uv/concepts/resolution/#limited-resolution-environments) set, uv locks for
+those environments only. The lock records them as `supported-markers`, leaves out the packages and wheels that only
+other environments need, and `uv sync` fails anywhere else ("The current Python platform is not compatible with the
+lockfile's supported environments"). wheelgap follows uv:
+
+- a target inside the environments is checked as always;
+- a target you asked for (`-t`, `[tool.wheelgap] targets`, `--dockerfile`, a `-p`) that is outside them is an error
+  (exit code 2, and the [error object](output.md#json) with `--json`) that names the targets the lock doesn't cover
+  and the ones it does, instead of a table of gaps that only say the lock left that platform out. `--online` doesn't
+  change this: it can look up the wheels again, but not the packages the lock left out;
+- the built-in default platforms are narrowed to the ones the lock covers, with a note on stderr, so
+  `wheelgap uv.lock` on a Linux-only lock checks `linux-x86_64` and `linux-aarch64`. A default platform the lock
+  covers for only some of the Pythons you asked for stays, and is the error above. `wheelgap diff` drops only the
+  platforms both locks leave out, so a platform one lock covers and the other doesn't (one the new lock gives up or
+  adds) is the error above too, and so is any platform when one side isn't a `uv.lock`;
+- an [`--advisory`](cli.md#advisory) target the lock leaves out isn't checked, with a note, since it never fails the
+  run.
+
+A target is inside when any of the markers holds for it. They are evaluated for the target's `sys_platform`,
+`platform_machine`, `os_name`, `platform_system`, `platform_python_implementation`, `implementation_name`,
+`python_version` and `python_full_version`. Where no marker holds for sure and one can't be decided for the target
+(`platform_release`, `platform_machine` on `win32`, a patch release such as `python_full_version >= '3.13.2'`),
+wheelgap says it can't tell and stops, also with exit code 2, rather than guess. To check a platform the lock doesn't
+cover, add it to `environments` and run `uv lock`.
+
 ## pylock.toml
 
 **Read:** each package's wheel and sdist filenames, its `marker`, its `index`, and the file's `requires-python`

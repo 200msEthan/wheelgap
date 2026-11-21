@@ -33,10 +33,14 @@ from .check import (
     Row,
     Status,
     check,
+    check_lock_environments,
     dropped_targets,
     explain,
     explain_lines,
+    lock_environment_targets,
+    lock_environments_note,
     marker_holds,
+    narrow_to_lock_environments,
     reachable,
 )
 from .codequality import write_codequality
@@ -2058,6 +2062,7 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 if any(p.startswith("musl-") for p in platforms):
                     note += "; Linux markers select both glibc and musl targets"
                 print(note, file=sys.stderr)
+        default_platforms = not platforms
         targets = build_targets(
             pythons,
             platforms,
@@ -2133,11 +2138,36 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 "uv.lock (not a script's), one requirements file or package names on the command line "
                 "(--fix alone covers the others)"
             )
+        if default_platforms:
+            # Nobody asked for these platforms, so a uv.lock made with [tool.uv] environments is checked on the
+            # default platforms it was locked for. One it covers for some of the Pythons only stays, and is an
+            # error below, as a platform that was asked for is.
+            targets, left_out = narrow_to_lock_environments(sources, targets)
+            if left_out and not quiet:
+                note = lock_environments_note(sources, left_out, targets, "default targets")
+                print(f"wheelgap: note: {note}", file=sys.stderr)
+            advisory = frozenset(t for t in advisory if t in targets)
+        elif advisory:
+            # An advisory target never fails the run, so one the lock leaves out isn't checked either: with a note,
+            # as for the defaults, rather than an error.
+            unlocked = {t for source in sources for t in lock_environment_targets(source, advisory)[0]}
+            if unlocked and len(unlocked) < len(targets):
+                if not quiet:
+                    print(
+                        f"wheelgap: note: {', '.join(s.label for s in sources if s.supported_markers)} is locked for "
+                        "`[tool.uv] environments` only, which leave out the advisory targets "
+                        f"{', '.join(t.label(len({t.python for t in targets}) > 1) for t in targets if t in unlocked)}"
+                        ": not checking them",
+                        file=sys.stderr,
+                    )
+                targets = [t for t in targets if t not in unlocked]
+                advisory = advisory - unlocked
         for source in sources:
             check_report_targets(source, targets)
             if source.found is not None:
                 for line in directory_notes(source.found):  # always: the file read isn't the one the name promises
                     print(f"wheelgap: note: {line}", file=sys.stderr)
+            check_lock_environments(source, targets)
             if source.passed_over is not None and not quiet:
                 print(
                     f"wheelgap: note: {source.path} was checked; {source.passed_over} is in the same folder too "
