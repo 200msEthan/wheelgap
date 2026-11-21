@@ -1918,6 +1918,7 @@ def _main(argv: list[str], project: Path | None = None) -> int:
         config_inputs = [str(context_dir)]
     else:
         config_inputs = args.inputs
+    docker_includes: dict[tuple[int, Path], tuple[Path, ...]] = {}
     docker_constraints: dict[Path, tuple[Path, ...]] = {}
     try:
         if args.dockerfile_inputs:
@@ -1926,6 +1927,7 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 Path(args.dockerfile),
                 build_args,
                 context=context,
+                includes=docker_includes,
                 constraints=docker_constraints,
                 dependencies=args.deps,
             )
@@ -1958,10 +1960,17 @@ def _main(argv: list[str], project: Path | None = None) -> int:
             image = read_dockerfile(Path(args.dockerfile), build_args)
             if not quiet:
                 for install_line, requirements in installs:
-                    with_constraints = "".join(f", -c {file}" for file in docker_constraints.get(requirements, ()))
+                    # Every file read: the requirements file and what it includes, then each -c file of the line
+                    # and what that includes (a -r in a constraints file is requirements, a -c more constraints).
+                    files = ", ".join(
+                        str(file) for file in (requirements, *docker_includes[install_line, requirements])
+                    )
+                    for constraint in docker_constraints.get(requirements, ()):
+                        files += f", -c {constraint}"
+                        if nested := docker_includes[install_line, constraint]:
+                            files += f" (which includes {', '.join(str(file) for file in nested)})"
                     print(
-                        f"wheelgap: note: {args.dockerfile}:{install_line}: RUN pip install -r reads {requirements}"
-                        f"{with_constraints}",
+                        f"wheelgap: note: {args.dockerfile}:{install_line}: RUN pip install -r reads {files}",
                         file=sys.stderr,
                     )
                 for name, value in image.build_args:
