@@ -476,9 +476,10 @@ The kinds: `image-not-read` (`-p` and `-t` stood in for an [image wheelgap can't
 `image-libc` (that image's tag says Alpine or musl, and glibc targets were checked);
 `passed-over:CLASS`, one per class of `RUN` line [`--dockerfile-inputs`](cli.md#dockerfile-inputs) didn't read
 because it installs no Python packages with pip or uv (`system-packages`, `shell`, `programs`, `venv`,
-`cache-mounts`, `installer-tools`), with `line` `null` and the line numbers in `lines`; `arg-unset` (an
+`cache-mounts`, `copy-from`, `installer-tools`), with `line` `null` and the line numbers in `lines`; `arg-unset` (an
 `ARG PIP_...` with no default, read as unset); and `system-python-packages` (system package commands on `lines`
-install Python packages, which pip may keep instead of fetching a requirement). The key is absent when there is nothing to say.
+install Python packages, which pip may keep instead of fetching a requirement). The key is absent when there is
+nothing to say.
 
 `dockerfile_packages` (after 0.13.0) has one entry per `RUN` line whose `pip install` names requirements on the
 line itself: `dockerfile`, `line`, the `installer` (`pip` or `uv pip`) and the `requirements` as written, variables
@@ -487,7 +488,7 @@ replaced. The line is also a source of its own in `sources` (`Dockerfile:5`). `k
 
 `dockerfile_warnings` (after 0.13.0, always there with `--dockerfile-inputs`) lists the `RUN` lines wheelgap
 couldn't see into, which may install Python packages the answer doesn't have: `dockerfile`, `line`, `kind`
-(`may-install`) and `message`. An empty list means every line was read or can't install any; a script should treat a
+(`may-install`, or `may-bring` for a `COPY --from` that may carry an environment from another stage) and `message`. An empty list means every line was read or can't install any; a script should treat a
 non-empty one as "this answer is not the whole image". Each such line comes after the last install wheelgap read: one
 before it is an error instead. With `--dockerfile-inputs`, `summary.complete` says the same as a boolean: `false`
 when `dockerfile_warnings` lists a line or `-p` and `-t` stood in for an image wheelgap couldn't read (the headline then says so too), `true` otherwise (absent without the flag). The exit code doesn't

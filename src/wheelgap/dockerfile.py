@@ -9,6 +9,7 @@ import os
 import posixpath
 import re
 import shlex
+import sys
 from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -829,6 +830,37 @@ def _split_from_as_written(args: str) -> str | None:
         return None
 
 
+def _stage_chain(froms: list[tuple[int, str]], global_args: _GlobalArgs) -> list[int]:
+    """The FROM lines of the stages the final image is made of, the base stage first: the final stage, the stage it
+    is built FROM, and so on back to the stage built FROM an image. A stage is found by its name as _final_from
+    finds it (the latest earlier `AS name`). A FROM in the chain with a build argument wheelgap can't expand is a
+    DockerfileError when a named stage comes before it, since it may name that stage."""
+    names: dict[str, int] = {}  # stage name -> index in froms
+    parents: list[int | None] = []
+    for index, (_, args) in enumerate(froms):
+        try:
+            expanded, unexpanded = _expand_build_args(args, global_args)[0], False
+        except UnknownImageError:
+            expanded, unexpanded = args, True
+        image, _, stage = _split_from(expanded)
+        parents.append(-1 if unexpanded and "$" in image and names else names.get(image))
+        if stage:
+            names[stage] = index
+    chain: list[int] = []
+    at: int | None = len(froms) - 1
+    while at is not None:
+        if parents[at] == -1:  # it may be any of the stages named before it
+            line, args = froms[at]
+            known = ", ".join(name for name, index in names.items() if index < at)
+            raise DockerfileError(
+                f"line {line}: FROM {_split_from(args)[0]} uses a build argument wheelgap can't expand, and it may "
+                f"name an earlier stage ({known}): pass its value with --build-arg"
+            )
+        chain.append(froms[at][0])
+        at = parents[at]
+    return chain[::-1]
+
+
 def parse_from(args: str) -> ImageTarget:
     """Parse `[--platform=P] image[:tag][@digest] [AS name]`."""
     image, platform, _ = _split_from(args)
@@ -1038,6 +1070,10 @@ class _Copy:
     into: bool  # the sources land inside dest: a / at its end, several sources, a folder, or dest a known folder
     error: str | None = None  # why wheelgap can't tell what this instruction puts in the image
     uv_binaries: tuple[str, ...] = ()
+    # COPY --from=STAGE-OR-IMAGE: what it names, and the paths it copies from there. wheelgap doesn't follow these:
+    # nothing under `dest` is read afterwards, and what the files are is only said in a note or a warning.
+    foreign: str | None = None
+    foreign_paths: tuple[str, ...] = ()
 
 
 def _add_dir(dirs: set[str], folder: str) -> None:
@@ -1070,16 +1106,27 @@ def _read_copy(
             target = posixpath.normpath(posixpath.join(workdir or "/", dest))
             _add_dir(dirs, target)
             return _Copy(number, (), target, True, uv_binaries=tuple(name[1:] for name in names))
-        return unread(f"COPY {source} isn't read by --dockerfile-inputs except when copying /uv and optional /uvx")
     if args.lstrip().startswith("[") or not _PLAIN_ARGS_RE.fullmatch(args):
         return unread(f"only a plain `COPY SRC... DEST` is read by --dockerfile-inputs ({_PLAIN}, no JSON form)")
     words = args.split()
+    foreign = None
     while words and words[0].startswith("--"):
-        if not _COPY_FLAG_RE.fullmatch(flag := words.pop(0)):
-            return unread(f"COPY {flag} isn't read by --dockerfile-inputs (only --chown, --chmod and --link are)")
+        flag = words.pop(0)
+        if flag.startswith("--from=") and foreign is None and len(flag) > len("--from="):
+            foreign = flag.removeprefix("--from=")
+        elif not _COPY_FLAG_RE.fullmatch(flag):
+            return unread(
+                f"COPY {flag} isn't read by --dockerfile-inputs (only --from, --chown, --chmod and --link are)"
+            )
     if len(words) < 2:
         return unread("COPY needs a source and a destination")
     *names, dest = words
+    if foreign is not None:
+        # The files of another stage or image. Where they land is known; what they are isn't.
+        if not dest.startswith("/") and workdir is None:
+            return unread(f"COPY to {dest}: a relative destination needs a WORKDIR with an absolute path before it")
+        target = posixpath.normpath(posixpath.join(workdir or "/", dest))
+        return _Copy(number, (), target, True, foreign=foreign, foreign_paths=tuple(names))
     sources = []
     root = context.resolve()
     for name in names:
@@ -1153,8 +1200,85 @@ def _copied_file(copy: _Copy, target: str, context: Path, ignore_rules: tuple[do
     return None
 
 
+# The folders pip reads a config file from, every folder above them (a home folder can be anywhere under /home), and
+# the image Python's prefix (pip reads `sys.prefix/pip.conf`): a command that writes one of these folders whole, or a
+# mount over one, or a folder copied there from another stage or image, may put a pip config file in place.
+_CONFIG_PARENTS = (
+    "/",
+    "/etc",
+    "/etc/xdg",
+    "/etc/xdg/pip",
+    "/root",
+    "/root/.config",
+    "/root/.config/pip",
+    "/root/.pip",
+    "/home",
+    "/usr",
+    "/usr/local",
+)
+# Words in a path that say Python packages may be in what a COPY --from brings: the answer then gets a warning.
+_PACKAGE_PATH_WORDS = ("site-packages", "dist-packages", "venv", "virtualenv", "conda", "python", ".local", "wheel")
+_PACKAGE_PATH_ROOTS = ("/", "/usr", "/usr/local", "/usr/lib", "/opt", "/root", "/home", "/install", "/app", "/srv")
+
+
+# Where the image's Python and pip, and the packages it imports first, live: a COPY --from into (or over) one of these
+# before an install may change the pip and Python it runs, which stops it. /root/.local and home folders hold the user
+# site-packages, which come before the image's own on sys.path.
+_PYTHON_HOMES = ("/usr/local/bin", "/usr/bin", "/bin", "/root/.local", "/home")
+_PYTHON_LIBS = ("/usr/local/lib", "/usr/lib", "/lib")
+
+
+# Modules `python -m pip` may import, which a file or folder of that name in the working folder (first on sys.path)
+# would replace: the standard library's, pip's own and the start-up hooks.
+_PIP_IMPORTS = frozenset(sys.stdlib_module_names) | {"pip", "setuptools", "pkg_resources", "_distutils_hack"}
+
+
+def _importable(name: str) -> bool:
+    """Whether a name in the working folder may be imported by `python -m pip` in place of the real module."""
+    return name.removesuffix(".py").split(".")[0] in _PIP_IMPORTS or name.endswith(".pth")
+
+
+def _over_image_python(dest: str) -> bool:
+    """Whether a COPY --from to `dest` may put another pip or Python in place of the image's: a bin folder, a user
+    site-packages, or a lib folder's Python (`/usr/local/lib/python3.13`, `libpython3.13.so`) or the lib folder
+    whole, not a lib folder's other entries (`/usr/local/lib/node_modules`)."""
+    return (
+        _within(dest, _PYTHON_HOMES)
+        or any(folder == dest or folder.startswith(dest.rstrip("/") + "/") for folder in _PYTHON_LIBS)
+        or re.search(r"/lib/(?:lib)?python", dest) is not None
+    )
+
+
+# What a path with Python in it looks like: a COPY --from with one is never only a note.
+_PYTHON_PATH_WORDS = (*_PACKAGE_PATH_WORDS, "pip", "lib", ".whl", ".egg", ".pth", ".py")
+
+
+def _may_hold_packages(copy: _Copy) -> bool:
+    """Whether a COPY --from may bring installed Python packages (an environment built in another stage): every
+    one does, unless it copies a single path that doesn't look like Python, and that is a file (it has a suffix) or
+    lands in a bin folder (`COPY --from=node /usr/local/bin/node /usr/local/bin/`). Telling a folder from a file
+    isn't possible from the Dockerfile, and a folder may be anything."""
+    if len(copy.foreign_paths) != 1:
+        return True
+    source = posixpath.normpath(copy.foreign_paths[0])
+    if any(word in path.lower() for path in (source, copy.dest) for word in _PYTHON_PATH_WORDS):
+        return True
+    into_bin = copy.dest in _BIN_DIRS or posixpath.dirname(copy.dest) in _BIN_DIRS or copy.dest.endswith("/bin")
+    return not (into_bin or "." in posixpath.basename(source).lstrip("."))
+
+
 def _copies_config(copy: _Copy, names: tuple[str, ...]) -> bool:
     """Whether COPY can put an installer configuration file anywhere in the image."""
+    if copy.foreign is not None:
+        if names == _UV_CONFIG_NAMES:
+            return True  # a folder from elsewhere may hold a uv.toml or a pyproject.toml
+        paths = (*copy.foreign_paths, copy.dest)
+        return (
+            any(_names_config(path) or posixpath.basename(path).lower() in names for path in paths)
+            or copy.dest in _CONFIG_PARENTS
+            or copy.dest.startswith("/home")
+            or "/.config" in copy.dest
+        )
     for rel, host, is_dir in copy.sources:
         if is_dir:
             for _, dirnames, filenames in os.walk(host):
@@ -1259,6 +1383,11 @@ def _find_copied_file(
     for copy in reversed(copies):
         if copy.error:
             raise DockerfileError(f"line {copy.line}: {copy.error}")
+        if copy.foreign is not None and not copy.uv_binaries and (target + "/").startswith(copy.dest.rstrip("/") + "/"):
+            raise DockerfileError(
+                f"line {number}: {target} may come from the COPY --from={copy.foreign} on line {copy.line}, and "
+                "--dockerfile-inputs doesn't follow files copied from another stage or image"
+            )
         if (host := _copied_file(copy, target, context, ignore_rules)) is not None:
             return host
     raise DockerfileError(f"line {number}: {target} isn't copied from the build context by a COPY before this line")
@@ -1743,6 +1872,7 @@ PASSED_OVER = {
     "programs": "other programs",
     "venv": "virtual environment set-up",
     "cache-mounts": "cache mounts",
+    "copy-from": "files copied from another stage or image",
 }
 
 # Environment variables that don't change which files pip picks, by pip's rule that PIP_<OPTION> sets the option
@@ -1776,22 +1906,6 @@ _CONFIG_WORDS = (
     "pydistutils.cfg",
     "sitecustomize",
 )
-# The folders pip reads a config file from, every folder above them (a home folder can be anywhere under /home), and
-# the image Python's prefix (pip reads `sys.prefix/pip.conf`): a command that writes one of these folders whole, or a
-# mount over one, may put a pip config file in place.
-_CONFIG_PARENTS = (
-    "/",
-    "/etc",
-    "/etc/xdg",
-    "/etc/xdg/pip",
-    "/root",
-    "/root/.config",
-    "/root/.config/pip",
-    "/root/.pip",
-    "/home",
-    "/usr",
-    "/usr/local",
-)
 # git commands that change the files of a work tree, which may be the folder a command runs in or any folder above it.
 _GIT_WRITES = frozenset(
     "checkout switch restore reset pull merge rebase cherry-pick revert stash apply am clean mv rm submodule".split()
@@ -1803,9 +1917,12 @@ _VERSIONED_RE = re.compile(r"(?:pip|python)(\d+\.\d+)", re.ASCII)
 # An installer run from inside another program's arguments: `node -e "…execSync('pip install x')"`, `ruby -e`,
 # `sed 'e pip install x'`, `git -c alias.x='!pip install x' x`, `tar --checkpoint-action=exec=…`.
 _HIDDEN_INSTALL_RE = re.compile(
-    r"(?<![\w.-])(?:pip[0-9.]*\s+(?:install|download|wheel)|uv\s+(?:pip|sync|tool|add|run))\b|-m\s*pip\b|"
-    r"(?<![\w.-])(?:poetry|pdm|pipenv|conda|mamba|micromamba|pipx|easy_install)\s+(?:install|add|sync|create)\b"
+    r"(?<![\w.-])(?:pip[0-9.]*|uv|poetry|pdm|pipenv|conda|mamba|micromamba|pipx|easy_install)(?![\w.-])"
+    r".*?(?<![\w-])(?:install|download|wheel|sync|add|run|create)(?![\w-])|-m\s*pip\b",
+    re.DOTALL,
 )
+# Commands whose arguments are files or package names, never a command line they run.
+_NO_HIDDEN_COMMANDS = frozenset("cp mv ln install rm rmdir mkdir chmod chown chgrp touch".split())
 # A file in a bin folder that is a Python, a pip or uv, and files Python reads at start-up.
 _PYTHON_FILE_RE = re.compile(r"(?:python|pip|uv|uvx)[0-9.]*(?:-config)?|.*\.pth|(?:site|user)customize\.py", re.ASCII)
 # Read-only probes: they don't install, so they don't need to be the image's Python.
@@ -1869,6 +1986,9 @@ class InputsReport:
     notes: list[tuple[int, str, str]] = field(default_factory=list)  # (line, kind, message)
     # (line, the requirements a `pip install NAME...` on it names, whether uv installs them), in order.
     named: list[tuple[int, list[str], bool]] = field(default_factory=list)
+    # (line, the instruction) for each COPY --from that may bring Python packages built in another stage or image:
+    # warnings like `warnings`, since the answer doesn't cover them.
+    copied: list[tuple[int, str]] = field(default_factory=list)
     # (line, what the line does) for every warning, in the order the lines run: an install after one is an error.
     unseen: list[tuple[int, str]] = field(default_factory=list)
     # (line, name) for each Python package a system package command installs (apk add py3-yaml, apt-get install
@@ -1901,6 +2021,7 @@ class _Install:
     unseen: int = 0  # how many lines wheelgap can't see into come before it (InputsReport.unseen)
     mounts: tuple[str, ...] = ()  # the folders a cache or tmpfs mount covers while it runs
     globs: tuple[str, ...] = ()  # unquoted `name[extra]` words, which the shell expands if a file in cwd matches
+    module: bool = False  # `python -m pip`, which imports from the working folder first
     created: int = 0  # how many of the reader's `created` come before it
 
 
@@ -1930,6 +2051,8 @@ class _RunReader:
         # bin put first on the PATH, ("unknown", why) for a folder wheelgap knows nothing about.
         self.path: tuple[str, str] | None = None
         self.ambiguous: dict[str, int] = {}  # names an ENV and then an ARG set, by the ARG's line
+        # Folders an ENV HOME or XDG_CONFIG_* makes pip read a config file from, besides _CONFIG_PARENTS.
+        self.config_dirs: set[str] = set()
         self.system_before = 0  # how many of report.system_python come before the last install read
         # (line, word, folder) for each word of a command that wasn't read and may name a file it writes.
         self.mentions: list[tuple[int, str, str | None]] = []  # with the folder the command ran in, if known
@@ -2186,7 +2309,8 @@ class _RunReader:
                         f"line {number}: `{' '.join(texts)[:60]}` names {text}, which may be a pip or uv config file"
                     )
                     break
-                if (_config_folder(folder) or folder in self.venvs) and not self._copies_no_config(words):
+                configured = _config_folder(folder) or folder in self.venvs or _within(folder, self.config_dirs)
+                if configured and not self._copies_no_config(words):
                     self.config_error = (
                         f"line {number}: `{' '.join(texts)[:60]}` writes into {text}, where pip or uv may read a "
                         "config file"
@@ -2423,7 +2547,10 @@ class _RunReader:
                 module = option[2:] or (args[1].text if args[1].exact else None)
                 rest = args[1:] if len(option) > 2 else args[2:]
                 if module == "pip":
-                    return self._pip(number, rest, False, uv_system, shown, stop)
+                    kind, detail = self._pip(number, rest, False, uv_system, shown, stop)
+                    if isinstance(detail, _Install):
+                        detail.module = True
+                    return kind, detail
                 if module == "uv":
                     return self._uv(number, rest, uv_system, shown, stop)
                 if module in ("venv", "virtualenv"):
@@ -2459,7 +2586,9 @@ class _RunReader:
             return "warning", f"`{shown}`, which runs commands wheelgap can't see"
         if base == "find" and any(word.text in ("-exec", "-execdir", "-ok", "-okdir") for word in args):
             return "warning", f"`{shown}`, which runs commands wheelgap can't see"
-        if base not in _READ_COMMANDS and _HIDDEN_INSTALL_RE.search(" ".join(word.text for word in args)):
+        if base not in _READ_COMMANDS | _NO_HIDDEN_COMMANDS | _SYSTEM_COMMANDS and _HIDDEN_INSTALL_RE.search(
+            " ".join(word.text for word in args)
+        ):
             # Programs that run what their arguments say (`node -e`, `sed 'e …'`, `npm exec -- pip install`);
             # echo and the other read-only commands only print it.
             return "warning", f"`{shown}`, which names an installer in its arguments"
@@ -2606,6 +2735,26 @@ def _not_newest(text: str) -> bool:
     except InvalidRequirement:
         return True
     return any(spec.operator not in (">=", ">") for spec in requirement.specifier)
+
+
+# ENV names that make Python use what a folder holds, and the ones that move where pip reads its config files.
+_PYTHON_PATH_VARIABLES = frozenset({"PATH", "PYTHONPATH", "VIRTUAL_ENV", "PYTHONHOME", "PYTHONUSERBASE"})
+_CONFIG_VARIABLES = frozenset({"HOME", "XDG_CONFIG_HOME", "XDG_CONFIG_DIRS"})
+
+
+def _within(path: str, folders: set[str] | tuple[str, ...]) -> bool:
+    """Whether `path` is one of `folders`, holds one, or is inside one."""
+    return any(
+        path == folder or folder.startswith(path.rstrip("/") + "/") or path.startswith(folder.rstrip("/") + "/")
+        for folder in folders
+    )
+
+
+def _config_dirs(name: str, folders: list[str]) -> set[str]:
+    """The folders pip reads a config file from when ENV `name` is `folders`."""
+    if name == "HOME":
+        return {posixpath.join(folder, sub) for folder in folders for sub in (".config/pip", ".pip")}
+    return {posixpath.join(folder, "pip") for folder in folders}
 
 
 def _names_config(text: str) -> bool:
@@ -2860,39 +3009,34 @@ def _dockerfile_requirements(
     if not froms:
         raise DockerfileError("no FROM line found")
     final_line = froms[-1][0]
-    # The FROM that names the final image: an earlier one if the final stage builds on a stage (`FROM ${BASE}` too).
     image_read = True  # an official python image, whose own Python is in /usr/local/bin
     official = False  # the official python image: no WORKDIR of its own
+    windows = False  # a Windows image, whose RUN lines run in cmd /S /C, not sh
+    bash_env: int | None = None  # the line of an ENV or ARG that sets BASH_ENV, which bash -c runs first
     try:
-        base_image, base_platform, base_line, _, _ = _final_from(text, build_args)
+        # The errors plain --dockerfile gives for the FROM lines come first.
+        base_image, base_platform, _, _, _ = _final_from(text, build_args)
         try:
-            parse_image(base_image, base_platform)
+            windows = parse_image(base_image, base_platform).platform.startswith("win")
             official = _image_name(base_image) in IMAGE_NAMES
         except UnknownImageError:
             image_read = False
-    except UnknownImageError as e:
-        image_read = False
-        # The caller has -p/-t for an image wheelgap can't read (it raised this error itself otherwise). The stage's
-        # instructions are read all the same, once it is certain the FROM names an image and not an earlier stage:
-        # a build argument wheelgap can't expand may name either.
-        base_line = e.line if e.line is not None else final_line
-        image = _split_from(froms[-1][1])[0]
-        stages = [stage for _, args in froms[:-1] if (stage := _split_from_as_written(args)) is not None]
-        if base_line == final_line and "$" in image and stages:
-            raise DockerfileError(
-                f"line {final_line}: FROM {image} uses a build argument wheelgap can't expand, and it may name an "
-                f"earlier stage ({', '.join(stages)}): pass its value with --build-arg"
-            ) from None
-    if base_line != final_line:
-        raise DockerfileError(
-            f"line {final_line}: the final stage builds on an earlier stage; --dockerfile-inputs only reads a final "
-            "stage built FROM an image"
-        )
-    start = max(i for i, (number, _) in enumerate(instructions) if number == final_line)
+    except UnknownImageError:
+        image_read = False  # the caller has -p/-t for an image wheelgap can't read (it raised this error otherwise)
+    chain = _stage_chain(froms, global_args)
+    from_lines = {number for number, _ in froms}
+    starts = {number: index for index, (number, _) in enumerate(instructions) if number in from_lines}
+    ends = sorted(starts.values())
+    # The instructions of each stage of the chain, the base stage first, with a None where a stage starts.
+    stream: list[tuple[int, str] | None] = []
+    for from_line in chain:
+        start = starts[from_line]
+        end = next((index for index in ends if index > start), len(instructions))
+        stream += [None, *instructions[start + 1 : end]]
     # A stage starts in its image's WorkingDir, or "/" when the image sets none (convert.go at dd75b49 runs
     # dispatchWorkdir only `if d.image.Config.WorkingDir != ""`, and an llb.State's dir defaults to "/"). The official
     # python images, and the debian, buildpack-deps and alpine images they are built FROM, set none; for any other
-    # image it isn't known.
+    # image it isn't known. A stage built FROM another starts in that stage's folder, as the chain is read here.
     workdir: str | None = "/" if official else None
     workdir_error: str | None = None
     run_error: str | None = None  # an instruction that changes how a later RUN installs
@@ -2952,6 +3096,9 @@ def _dockerfile_requirements(
         elif (folder != "/" or not official) and (folder == "/" or folder.split("/")[1] in _IMAGE_FOLDERS):
             why = f"{folder} is a folder of the image, which may hold files"
         if why is None and folder is not None:
+            if copy := next((c for c in copies if c.foreign is not None and _within(c.dest, {folder})), None):
+                why = f"the COPY --from={copy.foreign} on line {copy.line} may put files in {folder}"
+        if why is None and folder is not None:
             for line, word, cwd in [*reader.mentions[: install.seen], *reader.created[: install.created]]:
                 if word.startswith("/") or cwd is not None:
                     path = posixpath.normpath(posixpath.join(cwd or "/", word))
@@ -2985,6 +3132,7 @@ def _dockerfile_requirements(
             return
         raise DockerfileError(f"line {number}: {glob} is a glob to the shell, and {why}: {quote}")
 
+    python_dirs: dict[str, tuple[int, list[str]]] = {}  # ENV PYTHONPATH and the others: (line, their folders)
     reader = _RunReader(report, pythons, image_read)
     env: dict[str, str] = {}  # the ENV and ARG values wheelgap knows, as the shell of a RUN sees them
     uv_system = False  # ENV UV_SYSTEM_PYTHON=1: uv reads it as --system
@@ -2994,6 +3142,10 @@ def _dockerfile_requirements(
     global_defaults = global_args.defaults if not global_args.unreadable else {}
 
     def read_install(install: _Install) -> None:
+        if run_error:
+            raise DockerfileError(run_error)
+        if reader.config_error:
+            raise DockerfileError(reader.config_error)
         if install.unseen:
             # A line wheelgap can't see into may change what this install fetches (a requirements file, a pip config
             # file, PIP_ settings) or the pip and Python it runs: no answer is given. One after the last install
@@ -3006,12 +3158,43 @@ def _dockerfile_requirements(
                 "--dockerfile-inputs doesn't answer (such a line is only passed over, with a warning, after the "
                 "last install it reads)"
             )
-        if run_error:
-            raise DockerfileError(run_error)
-        if reader.config_error:
-            raise DockerfileError(reader.config_error)
+        foreign = [
+            copy for copy in copies if copy.foreign is not None and not copy.uv_binaries and _may_hold_packages(copy)
+        ]
+        if dependencies and foreign:
+            # pip keeps a package the copy brought if it satisfies a requirement, and that older copy's own
+            # dependencies then decide what else is fetched: the set --deps follows isn't known.
+            raise DockerfileError(
+                f"line {foreign[0].line}: COPY --from={foreign[0].foreign} may bring installed packages, which pip "
+                f"keeps, and with --deps their dependencies change what the install on line {number} fetches"
+            )
+        if install.module and (
+            shadow := next(
+                (
+                    c
+                    for c in foreign
+                    if install.cwd is None
+                    or c.dest == install.cwd
+                    or (posixpath.dirname(c.dest) == install.cwd and _importable(posixpath.basename(c.dest)))
+                ),
+                None,
+            )
+        ):
+            # `python -m pip` puts the working folder first on sys.path: a pip (or a module pip imports) copied
+            # there is the one that runs.
+            raise DockerfileError(
+                f"line {shadow.line}: COPY --from={shadow.foreign} may put files in "
+                f"{install.cwd or 'the working folder'}, and `python -m pip` on line {number} imports from that "
+                "folder first, so it may run another pip"
+            )
         uv = install.uv
         if uv and (config := next((copy for copy in copies if _copies_config(copy, _UV_CONFIG_NAMES)), None)):
+            if config.foreign is not None:
+                raise DockerfileError(
+                    f"line {config.line}: COPY --from={config.foreign} may bring a uv.toml or pyproject.toml, which "
+                    "uv reads settings from, and --dockerfile-inputs doesn't follow files copied from another "
+                    "stage or image: run uv pip install before this COPY"
+                )
             raise DockerfileError(
                 f"line {config.line}: this COPY puts a uv.toml or pyproject.toml in the image, and uv reads "
                 "settings from them: copy the requirements file alone and run uv pip install before this COPY"
@@ -3100,9 +3283,25 @@ def _dockerfile_requirements(
         if unread := next((copy for copy in copies if copy.error), None):
             raise DockerfileError(f"line {unread.line}: {unread.error}")
 
-    for number, instruction in instructions[start + 1 :]:
+    number = final_line
+    for item in stream:
+        if item is None:
+            # A new stage of the chain, built FROM the one just read. Its files, WORKDIR, ENV and SHELL are the
+            # parent's. Whether the parent's ARGs are still set depends on the BuildKit version (newer ones carry
+            # them over: `ds.buildArgs = append(ds.buildArgs, ds.base.buildArgs...)` in dockerfile2llb/convert.go),
+            # so their values are forgotten: an install that needs one is an error, not a guess.
+            for name in arg_values:
+                env.pop(name, None)
+            arg_values.clear()
+            continue
+        number, instruction = item
         parts = re.split(r"[ \t\v\f\r]+", instruction, maxsplit=1)
         keyword, args = parts[0].upper(), (parts[1].strip() if len(parts) > 1 else "")
+        if keyword == "ONBUILD" and number < final_line:
+            # A trigger of a stage the final stage builds on runs in the stage built FROM it.
+            raise DockerfileError(
+                f"line {number}: ONBUILD in a stage the final stage builds on isn't read by --dockerfile-inputs"
+            )
         if keyword == "WORKDIR":
             if not re.fullmatch(r"[A-Za-z0-9_./-]+", args, re.ASCII):
                 workdir, workdir_error = None, f"line {number}: WORKDIR {args}: only a literal path is read ({_PLAIN})"
@@ -3114,8 +3313,26 @@ def _dockerfile_requirements(
                 _add_dir(dirs, workdir)
         elif keyword == "COPY":
             copies.append(copy := _read_copy(number, args, workdir, dirs, context, context_label, ignore_rules))
-            if _copies_config(copy, _PIP_CONFIG_NAMES):
+            if _copies_config(copy, _PIP_CONFIG_NAMES) or (
+                copy.foreign is not None and _within(copy.dest, reader.config_dirs)
+            ):
                 run_error = f"line {number}: a pip config file may change what pip installs"
+            if copy.foreign is not None and _may_hold_packages(copy):
+                what = f"COPY --from={copy.foreign} {' '.join(copy.foreign_paths)} {copy.dest}"
+                report.copied.append((number, what))
+                if named := next(
+                    ((var, line) for var, (line, folders) in python_dirs.items() if _within(copy.dest, set(folders))),
+                    None,
+                ):
+                    # PYTHONPATH and friends were set before: Python now uses what this brings (patch B).
+                    report.unseen.append(
+                        (number, f"copies files into a folder ENV {named[0]} on line {named[1]} names ({what})")
+                    )
+                if _over_image_python(copy.dest) or _within(copy.dest, tuple(reader.venvs)):
+                    # It may put another pip or Python in place of the one a later install runs.
+                    report.unseen.append((number, f"copies files over the image's Python or pip ({what})"))
+            elif copy.foreign is not None:
+                report.passed("copy-from", number)
         elif keyword == "ADD":
             copies.append(_Copy(number, (), "", False, "ADD isn't read by --dockerfile-inputs, use COPY"))
         elif keyword == "SHELL":
@@ -3128,6 +3345,8 @@ def _dockerfile_requirements(
                 )
             bash = re.match(r'\[\s*"(?:/bin/|/usr/bin/)?bash"', args) is not None
         elif keyword in ("ENV", "ARG"):
+            if re.search(r"(?<![A-Za-z0-9_])BASH_ENV(?![A-Za-z0-9_])", args):
+                bash_env = number
             before = dict(env)  # an ENV's values are expanded with the values before it
             pairs = _env_pairs(keyword, args, build_args or {}, global_defaults)
             if pairs is None:
@@ -3180,12 +3399,65 @@ def _dockerfile_requirements(
                         if written is not None
                         else ("unknown", f"the {keyword} on line {number} sets PATH")
                     )
+                if name in _PYTHON_PATH_VARIABLES or name in _CONFIG_VARIABLES:
+                    written = _written_value(args, name) if keyword == "ENV" else value
+                    written = _expand_known(written, before) if written is not None else None
+                    folders = [
+                        posixpath.normpath(entry)
+                        for entry in (written or "").split(":")
+                        if entry.startswith("/") and "$" not in entry
+                    ]
+                    foreign = [copy for copy in copies if copy.foreign is not None and not copy.uv_binaries]
+                    if name in _CONFIG_VARIABLES:
+                        # pip reads a config file from under these: a copied folder there may bring one.
+                        if written is None or len(folders) != len((written or "").split(":")):
+                            run_error = (
+                                f"line {number}: {keyword} {name} moves where pip reads its config, to a folder "
+                                "wheelgap can't tell"
+                            )
+                        reader.config_dirs.update(_config_dirs(name, folders))
+                        if config := next((c for c in foreign if _within(c.dest, reader.config_dirs)), None):
+                            run_error = (
+                                f"line {number}: {keyword} {name} makes pip read its config from a folder the COPY "
+                                f"--from={config.foreign} on line {config.line} brought, which may hold a pip.conf"
+                            )
+                    else:
+                        # For a COPY --from after this ENV. An entry wheelgap can't expand (`$BASE/deps` with BASE an
+                        # ARG with no value, which BuildKit expands to "") may be any folder: "/" covers them all.
+                        unknown = any(
+                            "$" in entry and entry not in (f"${name}", f"${{{name}}}")  # not its own earlier value
+                            for entry in (written or "").split(":")
+                        )
+                        python_dirs[name] = (number, ["/"] if unknown else folders)
+                    if name not in _CONFIG_VARIABLES and (
+                        hit := next(
+                            ((c, f) for f in folders for c in foreign if _within(c.dest, {f}) or _within(f, {c.dest})),
+                            None,
+                        )
+                    ):
+                        copy, folder = hit
+                        what = (
+                            f"{keyword} {name} names {folder}, which the COPY --from={copy.foreign} on line "
+                            f"{copy.line} brought"
+                        )
+                        report.copied.append((number, what))
+                        report.unseen.append((number, f"uses files copied from another stage or image ({what})"))
                 if _installer_setting(name):
                     # The value is left out: an index URL may hold credentials.
                     run_error = f"line {number}: {keyword} {name} may change what pip or uv installs"
                 elif name == "UV_SYSTEM_PYTHON":
                     uv_system = value is not None and value.lower() in ("1", "true")
         elif keyword == "RUN":
+            if windows and not _PLAIN_ARGS_RE.fullmatch(_args_after_flags(args, "\\").strip()):
+                raise DockerfileError(
+                    f"line {number}: on a Windows image this RUN runs in cmd /S /C, whose quoting, variables and "
+                    f"operators --dockerfile-inputs doesn't read: only one plain command per RUN is ({_PLAIN})"
+                )
+            if bash and bash_env is not None:
+                raise DockerfileError(
+                    f"line {number}: bash runs the file ENV BASH_ENV on line {bash_env} names before this RUN, and "
+                    "--dockerfile-inputs can't see into it"
+                )
             body = "\n".join(bodies.get(number, []))
             for install in reader.read(
                 number, instruction, args, env, workdir, workdir_error, uv_system, arg_values, bash, body
@@ -3198,8 +3470,13 @@ def _dockerfile_requirements(
         if report.warnings:
             where = ", ".join(str(line) for line, _ in report.warnings)
             unseen = f" (it has commands wheelgap can't see into, which may install some: line {where})"
+        elif report.copied:
+            where = ", ".join(str(line) for line, _ in report.copied)
+            unseen = f" (it copies files from another stage or image, which may hold some: line {where})"
+        stages = "" if len(chain) == 1 else f", like the {len(chain) - 1} it builds on,"
         raise DockerfileError(
-            f"the final stage (line {final_line}) has no `RUN pip install` that --dockerfile-inputs can read" + unseen
+            f"the final stage (line {final_line}){stages} has no `RUN pip install` that --dockerfile-inputs can read"
+            + unseen
         )
     if constraints is not None:
         constraints.update(used_constraints)

@@ -1162,13 +1162,18 @@ def dockerfile_report_notes(
         if lines := report.passed_over.get(kind):
             if kind == "programs":
                 what += f" ({', '.join(report.programs)})"
+            # A copy from another stage isn't known to hold no packages: it is only not followed.
+            why = (
+                "not followed"
+                if kind == "copy-from"
+                else "not read, since they install no Python packages with pip or uv"
+            )
             notes.append(
                 {
                     "dockerfile": dockerfile,
                     "line": None,
                     "kind": f"passed-over:{kind}",
-                    "message": f"not read, since they install no Python packages with pip or uv: {what}, "
-                    f"{_line_list(lines)}",
+                    "message": f"{why}: {what}, {_line_list(lines)}",
                     "lines": sorted(lines),
                 }
             )
@@ -1211,13 +1216,30 @@ def dockerfile_report_notes(
         }
         for line, what in report.warnings
     ]
+    warnings += [
+        {
+            "dockerfile": dockerfile,
+            "line": line,
+            "kind": "may-bring",
+            "message": (
+                f"{what} copies files from another stage or image, which wheelgap doesn't follow"
+                if what.startswith("COPY")
+                else f"{what}, and wheelgap doesn't follow such files"
+            )
+            + ". If they hold Python packages, or another Python, that is not in this answer",
+        }
+        for line, what in report.copied
+    ]
+    order = sorted({line for line, _ in (*report.warnings, *report.copied)})
+    warnings.sort(key=lambda entry: order.index(entry["line"]))  # type: ignore[arg-type]
     unseen = ""
-    if report.warnings:
-        lines = sorted({line for line, _ in report.warnings})
-        unseen = (
-            f"{dockerfile} {_line_list(lines)} run{'s' if len(lines) == 1 else ''} commands wheelgap can't see "
-            "into: any Python packages they install are not in this answer."
-        )
+    if order:
+        one = len(order) == 1
+        does = f"run{'s' * one} commands wheelgap can't see into" if report.warnings else ""
+        if report.copied:
+            does += (", or " if does else "") + f"cop{'ies' if one else 'y'} files from another stage or image"
+        brought = "bring" if report.copied else "install"
+        unseen = f"{dockerfile} {_line_list(order)} {does}: any Python packages they {brought} are not in this answer."
     return notes, warnings, unseen
 
 
