@@ -3135,7 +3135,35 @@ def _main(argv: list[str], project: Path | None = None) -> int:
             if install_sites
             else None
         )
-        for command in github_annotations(rows, targets, sources, failing, advisory, fills, installed_by=installed_by):
+        # For each file a RUN line reads through -r or -c, the file on the line it is reached from, relative to the
+        # build context as the header and --json name it: the requirements file, or the -c file whose -r brought it
+        # (the requirements file when both lead there).
+        tops: dict[Path, dict[Path, str]] = {}
+        for install_line, requirements in installs:
+            reached = tops.setdefault(requirements, {})
+            for on_line in (requirements, *docker_constraints.get(requirements, ())):
+                for include in docker_includes.get((install_line, on_line), ()):
+                    if include.resolve() != requirements.resolve():  # a -c file's -r back to the file on the line
+                        reached.setdefault(include.resolve(), on_line.relative_to(context_dir).as_posix())
+        installed_through = (
+            {
+                package_id: tops[source.path]
+                for package_id, source in source_of.items()
+                if source.path is not None and source.path in tops
+            }
+            if install_sites
+            else None
+        )
+        for command in github_annotations(
+            rows,
+            targets,
+            sources,
+            failing,
+            advisory,
+            fills,
+            installed_by=installed_by,
+            installed_through=installed_through,
+        ):
             write_command(command, sys.stderr if args.json or args.markdown else sys.stdout)
         for level, file, at_line, message in dockerfile_results(dockerfile_notes, dockerfile_warnings):
             at_path = relative_path(Path(file))
