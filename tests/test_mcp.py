@@ -1398,7 +1398,11 @@ def test_check_lockfile_fix_says_when_no_gap_wheel_fits(fake_pypi, gap_wheels, t
     (_, reply) = run(init(), call("check_lockfile", path=nowheels_requirements(tmp_path), fix=True, **FT_WIN_ARM))
     data = reply["result"]["structuredContent"]
     assert data["gap_wheels"] == [] and gap_wheels.calls == 1
-    assert "the fix argument: no wheel on the gap wheel index fills these gaps" in data["notes"]
+    assert any(
+        note.startswith("the fix argument: no wheel on the gap wheel list fetched at ")
+        and note.endswith(" UTC fills these gaps")
+        for note in data["notes"]
+    )
 
 
 def test_check_lockfile_fix_refreshes_a_cached_list_that_fills_nothing(fake_pypi, gap_wheels, tmp_path, monkeypatch):
@@ -1406,7 +1410,8 @@ def test_check_lockfile_fix_refreshes_a_cached_list_that_fills_nothing(fake_pypi
 
     from wheelgap import cache
 
-    monkeypatch.setattr(cache, "_now", lambda: 1_700_000_000.0)  # 2023-11-14 22:13:20 UTC
+    now = 1_700_000_000.0  # 2023-11-14 22:13:20 UTC
+    monkeypatch.setattr(cache, "_now", lambda: now)
     path = nowheels_requirements(tmp_path)
 
     def check():
@@ -1416,7 +1421,8 @@ def test_check_lockfile_fix_refreshes_a_cached_list_that_fills_nothing(fake_pypi
     # The list is cached with a wheel for another package: it fills nothing here.
     gap_wheels.add("psycopg2", "2.9.11", "psycopg2-2.9.11-cp314-cp314t-win_arm64.whl")
     assert check()["gap_wheels"] == [] and gap_wheels.calls == 1
-    # A refresh that fails: the answer comes from the cached list, and the note says so with its time.
+    # Past the 5-minute recheck window, a refresh that fails answers from the cached list with its time.
+    now += cache.GAP_WHEELS_RECHECK_AGE + 60
     live, gap_wheels.doc = gap_wheels.doc, urllib.error.URLError("temporary failure")
     data = check()
     assert data["gap_wheels"] == [] and gap_wheels.calls == 2
@@ -1425,7 +1431,6 @@ def test_check_lockfile_fix_refreshes_a_cached_list_that_fills_nothing(fake_pypi
         "the list couldn't be refreshed"
     )
     assert stale in data["notes"]
-    assert "the fix argument: no wheel on the gap wheel index fills these gaps" not in data["notes"]
     # The wheel is published: the cached list still lacks it, so the list is fetched again and the fill is found.
     gap_wheels.doc = live
     gap_wheels.add("nowheels", "0.9", FT_WHEEL)
@@ -1437,6 +1442,10 @@ def test_check_lockfile_fix_refreshes_a_cached_list_that_fills_nothing(fake_pypi
 
 def test_check_lockfile_quiet_config_keeps_notes(fake_pypi, gap_wheels, tmp_path, monkeypatch):
     # A project that sets quiet = true for its own terminal runs must not lose the MCP notes.
+    from wheelgap import cache
+
+    # The no-fill note names the minute the list was fetched: a clock that moves on could split the two runs.
+    monkeypatch.setattr(cache, "_now", lambda: 1_700_000_000.0)
     path = nowheels_requirements(tmp_path)
     (tmp_path / "pyproject.toml").write_text("[tool.wheelgap]\nquiet = true\n", encoding="utf-8")
 
@@ -1447,7 +1456,11 @@ def test_check_lockfile_quiet_config_keeps_notes(fake_pypi, gap_wheels, tmp_path
     # The --fix note, with the gap wheel list from the fixture: no wheel fills the gap.
     quiet = check(fix=True, **FT_WIN_ARM)
     assert quiet["gap_wheels"] == []
-    assert "the fix argument: no wheel on the gap wheel index fills these gaps" in quiet["notes"]
+    assert any(
+        note.startswith("the fix argument: no wheel on the gap wheel list fetched at ")
+        and note.endswith(" UTC fills these gaps")
+        for note in quiet["notes"]
+    )
     (tmp_path / "pyproject.toml").unlink()
     assert check(fix=True, **FT_WIN_ARM)["notes"] == quiet["notes"]
 
@@ -1471,14 +1484,22 @@ def test_check_lockfile_quiet_config_keeps_notes(fake_pypi, gap_wheels, tmp_path
     assert check(fix=True, **FT_WIN_ARM)["notes"] == quiet["notes"]
 
 
-def test_check_dockerfile_quiet_config_keeps_notes(fake_pypi, gap_wheels, tmp_path):
+def test_check_dockerfile_quiet_config_keeps_notes(fake_pypi, gap_wheels, tmp_path, monkeypatch):
+    from wheelgap import cache
+
+    # The no-fill note names the minute the list was fetched: a clock that moves on could split the two runs.
+    monkeypatch.setattr(cache, "_now", lambda: 1_700_000_000.0)
     (tmp_path / "Dockerfile").write_text("FROM python:3.13-alpine\n", encoding="utf-8")
     (tmp_path / "pyproject.toml").write_text("[tool.wheelgap]\nquiet = true\n", encoding="utf-8")
     arguments = {"dockerfile": str(tmp_path / "Dockerfile"), "path": nowheels_requirements(tmp_path)}
     (_, quiet_reply) = run(init(), call("check_dockerfile", fix=True, **arguments))
     quiet = quiet_reply["result"]["structuredContent"]
     assert quiet["gap_wheels"] == []
-    assert "the fix argument: no wheel on the gap wheel index fills these gaps" in quiet["notes"]
+    assert any(
+        note.startswith("the fix argument: no wheel on the gap wheel list fetched at ")
+        and note.endswith(" UTC fills these gaps")
+        for note in quiet["notes"]
+    )
     (tmp_path / "pyproject.toml").unlink()
     (_, reply) = run(init(), call("check_dockerfile", fix=True, **arguments))
     assert reply["result"]["structuredContent"]["notes"] == quiet["notes"]
