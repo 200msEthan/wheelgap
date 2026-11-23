@@ -671,6 +671,8 @@ def _parse_froms(
     build_args: Mapping[str, str] | None = None,
     instructions: list[tuple[int, str]] | None = None,
     bodies: dict[int, list[str]] | None = None,
+    *,
+    as_116: bool = False,
 ) -> tuple[list[tuple[int, str]], _GlobalArgs]:
     """(line number, arguments) of every FROM instruction in order, the line being where the instruction starts.
 
@@ -687,12 +689,12 @@ def _parse_froms(
     That's docker/dockerfile 1.16 and later. With no `# syntax=` line, wheelgap assumes Docker's built-in frontend
     is too: a known limit, since the classic builder and older built-in frontends read heredocs differently or not
     at all (to them, `FROM base` after `RUN : << '#'` is an instruction). A `# syntax=` frontend that reads a line's
-    heredocs differently from 1.16 is an error (see _heredoc_rules).
+    heredocs differently from 1.16 is an error (see _heredoc_rules), unless `as_116` asks for 1.16's reading anyway.
     """
     lines = [raw.rstrip("\r") for raw in text.split("\n")]  # Docker's trimNewline drops every trailing \r
     escape = _escape_char(lines)
     syntax = _syntax_directive(lines)
-    rules = _heredoc_rules(syntax)
+    rules = 16 if as_116 else _heredoc_rules(syntax)
     esc = re.escape(escape)
     continued = re.compile(rf"(?<!{esc}){esc}[ \t]*$")  # one escape char at the end, not two
     found: list[tuple[int, str]] = []
@@ -911,13 +913,13 @@ def final_from(text: str) -> tuple[str, str | None, int]:
 
 
 def _final_from(
-    text: str, build_args: Mapping[str, str] | None = None
+    text: str, build_args: Mapping[str, str] | None = None, *, as_116: bool = False
 ) -> tuple[str, str | None, int, dict[str, str], _GlobalArgs]:
     """final_from, plus the global ARG defaults that FROM used. Build arguments are expanded in every FROM, as
     Docker does, but one wheelgap can't expand is an error only in the FROM that names the final image: an
     earlier stage built `--platform=$BUILDPLATFORM` doesn't change the image the last stage runs on."""
     stages: dict[str, tuple[str, str | None, int, dict[str, str]]] = {}
-    lines, global_args = _parse_froms(text, build_args)
+    lines, global_args = _parse_froms(text, build_args, as_116=as_116)
     if not lines:
         raise DockerfileError("no FROM line found")
     errors: dict[int, UnknownImageError] = {}
@@ -1068,6 +1070,19 @@ def read_dockerfile(path: Path, build_args: Mapping[str, str] | None = None) -> 
         located = HeredocSyntaxError(f"{path}:{e.line}: {e}")
         located.line = e.line
         located.reason = e.reason
+        # -p and -t stand in only for how the heredoc is read. Read the rest as docker/dockerfile 1.16 does, so an
+        # error Docker raises anyway (an unterminated heredoc, FROM scratch, an unknown stage) still stops the run,
+        # and the final image's tag is kept for the Alpine (musl) note.
+        number = None
+        try:
+            image, platform, number, _, _ = _final_from(text, build_args, as_116=True)
+            located.image = image
+            parse_image(image, platform)
+        except UnknownImageError:
+            pass
+        except DockerfileError as plain:
+            where = f"{path}:{number}" if number is not None and str(plain).startswith("FROM scratch") else path
+            raise DockerfileError(f"{where}: {plain}") from None
         raise located from None
     except UnknownImageError as e:
         error = UnknownImageError(f"{path}: {e}")

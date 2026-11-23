@@ -3103,6 +3103,35 @@ def test_old_syntax_heredoc_error_names_the_line_of_a_continued_instruction(tmp_
         dockerfile_requirements(path)
 
 
+@pytest.mark.parametrize(
+    "rest, error",
+    [
+        ("FROM scratch\nCOPY --from=build /x /x\n", ":6: FROM scratch: the image starts empty"),
+        ("FROM python:3.13\nRUN cat <<END\nhi\n", ": unterminated heredoc <<END (BuildKit rejects it)"),
+    ],
+)
+def test_cli_dockerfile_old_syntax_heredoc_still_stops_on_what_docker_rejects(tmp_path, capsys, fake_pypi, rest, error):
+    # -p and -t stand in only for how the heredoc is read: an error in the rest of the file still stops the run.
+    text = "# syntax=docker/dockerfile:1.4\nFROM python:3.13 AS build\nRUN cat > /x << EOF\nhi\nEOF\n" + rest
+    path = _context(tmp_path, text)
+    requirements = tmp_path / "requirements.txt"
+    assert main([str(requirements), "--dockerfile", str(path), "-p", "3.13", "-t", "linux-x86_64"]) == 2
+    err = capsys.readouterr().err
+    assert f"wheelgap: error: {path}{error}" in err
+    assert "isn't read" not in err
+    assert fake_pypi == []
+
+
+def test_cli_dockerfile_old_syntax_heredoc_keeps_the_alpine_note(tmp_path, capsys, fake_pypi):
+    # The tag is still read as 1.16 reads the file, so an Alpine final image still gets the musl note.
+    path = _context(tmp_path, "# syntax=docker/dockerfile:1.4\nFROM python:3.13-alpine\nRUN cat > /x << EOF\nhi\nEOF\n")
+    requirements = tmp_path / "requirements.txt"
+    argv = [str(requirements), "--dockerfile", str(path), "-p", "3.13", "-t", "linux-x86_64", "--json"]
+    assert main(argv) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert [n["kind"] for n in data["dockerfile_notes"]] == ["image-not-read", "image-libc"]
+
+
 def test_cli_dockerfile_reads_any_image_when_p_and_t_are_given(tmp_path, capsys, fake_pypi):
     path = _context(tmp_path, "FROM ubuntu:24.04\nRUN anything at all\n")
     assert main(["purewheel", "--dockerfile", str(path), "-p", "3.13", "-t", "linux-x86_64", "--glibc", "2.39"]) == 0
