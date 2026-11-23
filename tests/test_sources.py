@@ -2402,6 +2402,42 @@ def test_requirements_options_after_a_requirement_keep_its_pin_and_hash_mode(tmp
         ("purewheel", None, ">=3"),
     ]
     assert source.compiled and source.specs == ["fastlib==2.0.0", "purewheel>=3"]
+    assert source.packages[0].hashes == frozenset({"aa"})
+    assert source.packages[1].hashes == frozenset()
+
+
+def test_requirements_hashes_preserved_for_both_spellings_and_continuation(tmp_path):
+    req = tmp_path / "requirements.txt"
+    req.write_text(
+        "pkg_eq==1.0 --hash=sha256:1111\n"
+        "pkg_space==2.0 --hash sha256:2222\n"
+        "pkg_continued==3.0 \\\n"
+        "    --hash=sha256:3333 \\\n"
+        "    --hash sha256:4444\n"
+    )
+    source = parse_requirements(req)
+    assert [(p.name, p.version, p.hashes) for p in source.packages] == [
+        ("pkg_eq", "1.0", frozenset({"1111"})),
+        ("pkg_space", "2.0", frozenset({"2222"})),
+        ("pkg_continued", "3.0", frozenset({"3333", "4444"})),
+    ]
+
+
+def test_requirements_hashes_keep_sha256_only_lowercased(tmp_path):
+    # pip lowercases the hashes it's given, and only a sha256 can match a file on PyPI, which gives no other digest
+    # (pip 26.3 takes the sdist for `--hash=sha256:<sdist> --hash=sha512:<wheel>`). A line with only sha384/sha512
+    # hashes is read as without --hash: pip checks its pick after the download, which wheelgap can't do.
+    req = tmp_path / "requirements.txt"
+    req.write_text(
+        f"upper==1.0 --hash=sha256:{'AB' * 32}\n"
+        f"other==1.0 --hash=sha512:{'cd' * 64} --hash=sha384:{'cd' * 48}\n"
+        f"mixed==1.0 --hash=sha512:{'ef' * 64} --hash=sha256:{'12' * 32}\n"
+    )
+    assert [p.hashes for p in parse_requirements(req).packages] == [
+        frozenset({"ab" * 32}),
+        frozenset(),
+        frozenset({"12" * 32}),
+    ]
 
 
 @pytest.mark.parametrize(

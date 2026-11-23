@@ -33,10 +33,10 @@ This page summarizes each difference, what wheelgap assumes, what installers do,
 
 ## Requirements file hashes
 
-- **What wheelgap assumes:** `--hash` options in requirements files (`--hash=sha256:...`) are ignored during file selection.
-- **What pip and uv do:** `pip` and `uv` restrict candidate downloads strictly to files matching one of the specified hashes. If a hash is provided only for the sdist, pip builds from source even when matching wheels exist on PyPI.
-- **When it changes the answer:** A package pinned with only an sdist hash is reported by wheelgap as `wheel` if prebuilt wheels exist, while pip and uv build it from source.
-- **Tracking:** Tracked in [#633](https://github.com/wheelgap/wheelgap/issues/633).
+- **What wheelgap assumes:** A requirement's `--hash=sha256:…` options limit which of its release's files are checked (after 0.13.0), by the `sha256` digests PyPI's JSON API gives, and a range takes the newest release that has a listed file. A file the index gives no `sha256` for (some mirrors behind `WHEELGAP_INDEX_URL`) is kept. Not read yet, so the answer is the one without them: `sha384` and `sha512` hashes, `--hash` on a line of a constraints file, and the lookups of `--index-url`.
+- **What pip and uv do:** They install only a file whose hash is listed: with only the sdist's hash, they build from source even when a matching wheel exists on PyPI. A file whose hash the index doesn't give is downloaded and refused if its hash isn't listed. pip also hash-checks the whole install once any requirement has a `--hash`, and refuses it when another requirement has none.
+- **When it changes the answer:** With only `sha384`/`sha512` hashes, a `--hash` in a constraints file, or `--index-url`, wheelgap can say `wheel` where pip and uv build the sdist or refuse the download. On an index without digests it can say `wheel` where pip downloads a wheel whose hash isn't listed and stops. wheelgap doesn't refuse a file in which one requirement has a `--hash` and another has none, which pip refuses.
+- **Tracking:** [#633](https://github.com/wheelgap/wheelgap/issues/633) made `--hash=sha256` count; the cases above aren't tracked yet.
 
 ## Additional index URLs
 
