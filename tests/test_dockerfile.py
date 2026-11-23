@@ -3028,6 +3028,81 @@ def test_cli_dockerfile_inputs_reads_any_image_when_p_and_t_are_given(tmp_path, 
         assert fake_pypi == []
 
 
+# The Dockerfile of #683: line 9's `<< EOF` is a heredoc to docker/dockerfile 1.16, and isn't one to 1.4.
+_OLD_SYNTAX_HEREDOC = (
+    "# syntax=docker/dockerfile:1.4\n"
+    "FROM python:3.13-slim\n"
+    "WORKDIR /app\n"
+    "COPY requirements.txt .\n"
+    "RUN pip install -r requirements.txt\n"
+    "RUN cat > /etc/motd <<EOF\n"
+    "hello ${HOME}\n"
+    "EOF\n"
+    "RUN cat > /etc/x << EOF\n"
+    "hi\n"
+    "EOF\n"
+)
+_OLD_SYNTAX_REASON = (
+    "# syntax=docker/dockerfile:1.4 may read the heredocs in 'RUN cat > /etc/x << EOF' differently from "
+    "docker/dockerfile 1.16 and later, which wheelgap follows"
+)
+
+
+@pytest.mark.parametrize("flags", [[], ["-p", "3.13"], ["-t", "linux-x86_64"], ["-p", "3.13", "-t", "linux-x86_64"]])
+def test_cli_dockerfile_inputs_old_syntax_heredoc_error_names_the_line_and_what_helps(
+    tmp_path, capsys, fake_pypi, flags
+):
+    path = _context(tmp_path, _OLD_SYNTAX_HEREDOC)
+    (tmp_path / "requirements.txt").write_text("purewheel==3.1\n", encoding="utf-8")
+    assert main(["--dockerfile", str(path), "--dockerfile-inputs", *flags]) == 2
+    err = capsys.readouterr().err
+    # -p and -t don't say which lines are instructions, so they aren't the advice, given or not.
+    assert err == (
+        f"wheelgap: error: {path}:9: {_OLD_SYNTAX_REASON}; drop the # syntax= line, or set it to "
+        "docker/dockerfile:1 (the newest 1.x)\n"
+    )
+    assert "-p/-t" not in err
+    assert fake_pypi == []
+
+
+def test_cli_dockerfile_old_syntax_heredoc_is_an_image_p_and_t_stand_in_for(tmp_path, capsys, fake_pypi):
+    path = _context(tmp_path, _OLD_SYNTAX_HEREDOC)
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("purewheel==3.1\n", encoding="utf-8")
+    argv = [str(requirements), "--dockerfile", str(path), "--json"]
+    assert main([*argv, "-p", "3.13", "-t", "linux-x86_64"]) == 0
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)
+    assert [(t["python"], t["platform"]) for t in data["targets"]] == [("3.13", "linux-x86_64")]
+    assert [p["name"] for p in data["packages"]] == ["purewheel"]
+    assert f"wheelgap: note: {path}:9: the final image isn't read ({_OLD_SYNTAX_REASON}), so this run checks" in (
+        captured.err
+    )
+    assert "wheelgap: error" not in captured.err
+    [note] = data["dockerfile_notes"]
+    assert (note["dockerfile"], note["line"], note["kind"]) == (str(path), 9, "image-not-read")
+    # Without both -p and -t it is still an error, with the line, and still says to pass them.
+    for flags in ([], ["-p", "3.13"], ["-t", "linux-x86_64"]):
+        fake_pypi.clear()
+        assert main([*argv, *flags]) == 2
+        captured = capsys.readouterr()
+        assert f"wheelgap: error: {path}:9: {_OLD_SYNTAX_REASON}, pass -p/-t instead\n" in captured.err
+        assert "isn't read" not in captured.err
+        assert fake_pypi == []
+
+
+def test_old_syntax_heredoc_error_names_the_line_of_a_continued_instruction(tmp_path):
+    # The line is where the instruction starts, as for every other instruction.
+    path = _context(
+        tmp_path, "# syntax=docker/dockerfile:1.4\nFROM python:3.13-slim\n\nRUN cat \\\n  << EOF\nhi\nEOF\n"
+    )
+    with pytest.raises(UnknownImageError, match=rf"^{re.escape(str(path))}:4: # syntax=docker/dockerfile:1\.4 ") as e:
+        read_dockerfile(path)
+    assert e.value.line == 4
+    with pytest.raises(DockerfileError, match=rf"^{re.escape(str(path))}:4: .*; drop the # syntax= line"):
+        dockerfile_requirements(path)
+
+
 def test_cli_dockerfile_reads_any_image_when_p_and_t_are_given(tmp_path, capsys, fake_pypi):
     path = _context(tmp_path, "FROM ubuntu:24.04\nRUN anything at all\n")
     assert main(["purewheel", "--dockerfile", str(path), "-p", "3.13", "-t", "linux-x86_64", "--glibc", "2.39"]) == 0
