@@ -1070,18 +1070,22 @@ def read_dockerfile(path: Path, build_args: Mapping[str, str] | None = None) -> 
         located = HeredocSyntaxError(f"{path}:{e.line}: {e}")
         located.line = e.line
         located.reason = e.reason
-        # -p and -t stand in only for how the heredoc is read. Read the rest as docker/dockerfile 1.16 does, so an
-        # error Docker raises anyway (an unterminated heredoc, FROM scratch, an unknown stage) still stops the run,
-        # and the final image's tag is kept for the Alpine (musl) note.
-        number = None
+        # -p and -t stand in only for how the heredoc is read. Read the file again as docker/dockerfile 1.16 does,
+        # for the final image's tag (the Alpine (musl) note) and an error in the image that reading names.
         try:
             image, platform, number, _, _ = _final_from(text, build_args, as_116=True)
-            located.image = image
+        except DockerfileError:
+            # An unknown stage, or an error in reading the instructions (an unterminated heredoc): the old frontend
+            # may read those lines another way (`RUN echo hi << EOF` under 1.4 has no heredoc), so the refusal stands.
+            raise located from None
+        located.image = image
+        try:
             parse_image(image, platform)
         except UnknownImageError:
             pass
         except DockerfileError as plain:
-            where = f"{path}:{number}" if number is not None and str(plain).startswith("FROM scratch") else path
+            # FROM scratch: a heredoc body seldom holds a FROM, so the old frontend almost surely ends there too.
+            where = f"{path}:{number}" if str(plain).startswith("FROM scratch") else path
             raise DockerfileError(f"{where}: {plain}") from None
         raise located from None
     except UnknownImageError as e:

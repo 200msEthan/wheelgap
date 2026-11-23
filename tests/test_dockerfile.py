@@ -3103,23 +3103,52 @@ def test_old_syntax_heredoc_error_names_the_line_of_a_continued_instruction(tmp_
         dockerfile_requirements(path)
 
 
-@pytest.mark.parametrize(
-    "rest, error",
-    [
-        ("FROM scratch\nCOPY --from=build /x /x\n", ":6: FROM scratch: the image starts empty"),
-        ("FROM python:3.13\nRUN cat <<END\nhi\n", ": unterminated heredoc <<END (BuildKit rejects it)"),
-    ],
-)
-def test_cli_dockerfile_old_syntax_heredoc_still_stops_on_what_docker_rejects(tmp_path, capsys, fake_pypi, rest, error):
-    # -p and -t stand in only for how the heredoc is read: an error in the rest of the file still stops the run.
-    text = "# syntax=docker/dockerfile:1.4\nFROM python:3.13 AS build\nRUN cat > /x << EOF\nhi\nEOF\n" + rest
+def test_cli_dockerfile_old_syntax_heredoc_still_stops_on_a_final_from_scratch(tmp_path, capsys, fake_pypi):
+    # -p and -t stand in only for how the heredoc is read: a final FROM scratch, read as 1.16 reads the file, still
+    # stops the run.
+    text = (
+        "# syntax=docker/dockerfile:1.4\nFROM python:3.13 AS build\nRUN cat > /x << EOF\nhi\nEOF\n"
+        "FROM scratch\nCOPY --from=build /x /x\n"
+    )
     path = _context(tmp_path, text)
     requirements = tmp_path / "requirements.txt"
     assert main([str(requirements), "--dockerfile", str(path), "-p", "3.13", "-t", "linux-x86_64"]) == 2
     err = capsys.readouterr().err
-    assert f"wheelgap: error: {path}{error}" in err
+    assert f"wheelgap: error: {path}:6: FROM scratch: the image starts empty" in err
     assert "isn't read" not in err
     assert fake_pypi == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Under 1.4 `<< EOF` is no heredoc, so this builds; read as 1.16 reads it, the heredoc is never closed.
+        "# syntax=docker/dockerfile:1.4\nFROM python:3.13-slim\nRUN echo hi << EOF\n",
+        "# syntax=docker/dockerfile:1.4\nFROM python:3.13-slim\nRUN echo hi << EOF\nRUN cat <<END\nhi\n",
+    ],
+)
+def test_cli_dockerfile_old_syntax_heredoc_is_not_called_unterminated(tmp_path, capsys, fake_pypi, text):
+    # How the old frontend reads the lines after the heredoc isn't known, so an unterminated heredoc in 1.16's reading
+    # isn't said to be BuildKit's answer: the refusal stands, and -p and -t stand in for the image as usual.
+    path = _context(tmp_path, text)
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("purewheel==3.1\n", encoding="utf-8")
+    argv = [str(requirements), "--dockerfile", str(path)]
+    reason = (
+        "# syntax=docker/dockerfile:1.4 may read the heredocs in 'RUN echo hi << EOF' differently from "
+        "docker/dockerfile 1.16 and later, which wheelgap follows"
+    )
+    assert main(argv) == 2
+    err = capsys.readouterr().err
+    assert f"wheelgap: error: {path}:3: {reason}, pass -p/-t instead\n" in err
+    assert "unterminated" not in err
+    assert fake_pypi == []
+    assert main([*argv, "-p", "3.13", "-t", "linux-x86_64", "--json"]) == 0
+    captured = capsys.readouterr()
+    assert f"wheelgap: note: {path}:3: the final image isn't read ({reason}), so this run checks" in captured.err
+    assert "unterminated" not in captured.err
+    [note] = json.loads(captured.out)["dockerfile_notes"]
+    assert (note["line"], note["kind"]) == (3, "image-not-read")
 
 
 def test_cli_dockerfile_old_syntax_heredoc_keeps_the_alpine_note(tmp_path, capsys, fake_pypi):
